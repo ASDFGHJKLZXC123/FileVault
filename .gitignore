@@ -1,0 +1,10 @@
+/build/
+/out/
+/.vscode/
+/.idea/
+.DS_Store
+*.user
+*.swp
+*.tmp
+compile_commands.json
+Testing/
