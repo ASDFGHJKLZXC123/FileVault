@@ -8,3 +8,7 @@
 *.tmp
 compile_commands.json
 Testing/
+
+# Planning docs kept locally, not published to the repo
+LocalVault_Technical_Implementation_Guide.md
+LocalVault_Technical_Implementation_Guide.ORIGINAL.md
