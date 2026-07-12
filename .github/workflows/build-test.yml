@@ -27,7 +27,7 @@ jobs:
       - name: Install build tools and Qt system prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config autoconf automake libtool \
+          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool \
             libx11-dev libx11-xcb-dev libxext-dev libxrender-dev libxi-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libgl1-mesa-dev libglu1-mesa-dev \
             libxrandr-dev libxcursor-dev libxdamage-dev libxinerama-dev \
@@ -66,8 +66,8 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Install Ninja
-        run: brew install ninja
+      - name: Install build tools
+        run: brew install ninja autoconf autoconf-archive automake libtool
 
       - name: Bootstrap pinned vcpkg
         env:
