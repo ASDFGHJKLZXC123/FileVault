@@ -122,24 +122,24 @@ logic exists yet, by design (see M0 doc, "Likely problems and confusions" item 8
     the same benign `ranlib: ... has no symbols` notice on empty `core.cpp`). ctest log shows
     `Version.LocalVaultVersionIsDefined` passed, 100% tests passed.
 
-15. **All three CI jobs green on the same commit** — **UNVERIFIABLE**. No GitHub/`gh` access in
-    this session, and `git status` shows the repo is 1 commit ahead of `origin/main` — nothing
-    has been pushed, so no CI run exists to inspect. Structural review of the workflow (item 11)
-    is the only available partial evidence.
+15. **All three CI jobs green on the same commit** — **PASS** (updated after push). The repo was
+    pushed to `origin/main` and iterated through several CI-only fixes (see Addendum below); all
+    three jobs (linux/macos/windows) are green on commit `7fbad34`
+    (https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29196998004).
 
 16. **A second CI run on a trivial commit is fast (minutes, not ~an hour) — proof the vcpkg
-    binary cache works** — **UNVERIFIABLE**. Same reason as item 15: no CI runs exist yet
-    (nothing pushed). The workflow does correctly wire `x-gha` binary caching (item 11), which
-    is the necessary precondition, but cache-hit speed can only be confirmed once two runs exist
-    on GitHub Actions.
+    binary cache works** — **PASS** (updated after push). Run `29196998004` (a changelog-only
+    commit, `7fbad34`) completed in **macos 1m11s / windows 1m25s / linux 1m41s**, down from
+    30–70 minutes on the prior (cache-cold) run `29194667306`. See Addendum for why the
+    originally-wired `x-gha` cache had to be replaced first.
 
-17. **Zero compiler warnings from project code in any CI log** — **UNVERIFIABLE** for the actual
-    CI log (none exists yet). As partial/local evidence: a clean rebuild in this repo with
-    `-DLOCALVAULT_WARNINGS_AS_ERRORS=ON` (matching what CI passes on every configure) produced
-    zero `warning:` lines from `src/` or `include/` — the only two matches for `warning:` in the
-    full build log are the benign `ranlib: 'liblocalvault_core.a(core.cpp.o)' has no symbols`
-    notices, which are a linker/archiver informational message about the intentionally-empty
-    `src/core/core.cpp`, not a compiler warning, and are expected at this stage.
+17. **Zero compiler warnings from project code in any CI log** — **PASS** (updated after push).
+    Downloaded the full logs for all three jobs of run `29196998004` and grepped for compiler
+    warning patterns (`: warning:` / `warning C####:`); zero matches from `src/`, `include/`, or
+    any project file on any platform. The only warning-like output present is a benign CMake
+    "author" (dev) warning on macOS/Linux about the deprecated `SQLite::SQLite3` target name
+    (already noted above as inherent to the vcpkg SQLite3 port, not project code) and unrelated
+    tooling deprecation notices (Node.js 20, Homebrew untrusted-tap, npm punycode).
 
 ### Process
 
@@ -194,15 +194,55 @@ Real deviations found during this independent pass (all minor, none blocking):
 No other deviations from §7–§10 were found; the root bootstrap files, CMake presets, and cmake
 modules that were compared verbatim (items 3–6 above) matched the specification exactly.
 
+## Addendum — CI exercised (2026-07-12, after initial verification pass)
+
+The repo was pushed to `origin/main`, which surfaced three real (previously unverifiable, not
+merely theoretical) problems in the CI workflow. Each was fixed with a follow-up commit and a new
+CI run; the final state is captured in items 15–17 above.
+
+1. **Missing system packages for autotools-based vcpkg ports.** The first push (`a6db622`) ran CI
+   for the first time: `windows` passed (1h12m, expected first-run Qt-from-source cost), but
+   `linux` and `macos` both failed at `Configure` — `libb2` (macOS) and later `gperf` (Linux) need
+   `autoconf`/`automake`/`libtool`/`autoconf-archive` from the system package manager, which
+   §35.3's template omits for macOS entirely and only partially lists for Linux (missing
+   `autoconf-archive`, then later `libltdl-dev` for `libxcrypt`). Fixed incrementally
+   (`ae39052`, `3ce818c`), then — rather than keep discovering gaps one 15-minute CI run at a
+   time — adopted the Qt-relevant subset of packages from vcpkg's own CI provisioning script
+   (`scripts/azure-pipelines/linux/provision-image.sh` / `osx/setup-box.sh` in the pinned vcpkg
+   checkout) in one pass. This is a real deviation from build-plan §35.3's verbatim package
+   lists, made necessary by the spec's list being incomplete for this vcpkg baseline commit.
+2. **The `x-gha` binary caching backend referenced by §35.3 no longer exists.** Every job logged
+   `warning: The 'x-gha' binary caching backend has been removed` and rebuilt all 31 packages
+   from source on every run — silently defeating the entire point of item 16 on every prior CI
+   run, including the ones that were otherwise green. Upstream removed it
+   (microsoft/vcpkg-tool#1662) because GitHub Actions Cache's internal APIs changed underneath
+   it; Microsoft's own docs now redirect to either a GitHub Packages/NuGet feed (needs a PAT with
+   `packages:write`/`packages:read`, stored as a new repo secret) or `actions/cache` wrapping a
+   local `files` binary-cache directory. Chose the `actions/cache` + `files` route (`d48b514`) to
+   avoid introducing a new secret; confirmed working via cache-list API (three ~600MB–1GB caches
+   saved) and the run-29196998004 timings in item 16.
+3. **Deviation this introduces vs. the original §35.3 template**: the workflow no longer has an
+   `Export GitHub Actions cache variables for vcpkg` step or the `ACTIONS_CACHE_URL`/
+   `ACTIONS_RUNTIME_TOKEN` plumbing (dead code after the `x-gha` removal); replaced with an
+   `actions/cache@v4` step per job keyed on `vcpkg-archives-<os>-<pinned-commit>-<hash of
+   vcpkg.json>` with a commit-only restore-key fallback, and `VCPKG_BINARY_SOURCES` now points at
+   `clear;files,<workspace>/.vcpkg-archives,readwrite` instead of `clear;x-gha,readwrite`.
+
+None of these required touching any product code — all changes are confined to
+`.github/workflows/build-test.yml` and `CHANGELOG.md`, consistent with M0 closing zero functional
+requirements.
+
 ## Summary
 
-- **PASS: 17** (items 1–14, 18–20)
+- **PASS: 20** (all items)
 - **FAIL: 0**
-- **UNVERIFIABLE: 3** (items 15–17, all CI-log-dependent)
+- **UNVERIFIABLE: 0**
 
-**What blocks M0 from being called fully complete:** only a push to `origin` and a resulting CI
-run. The repo is 1 local commit ahead of `origin/main` with nothing pushed yet, so items 15–17
-(all three CI jobs green, second-run cache-speed proof, zero-warnings-in-CI-log) cannot be
-verified until that happens. Every other row — including the structural correctness of the
-workflow that would produce that CI run — passes. No FAIL rows were found; the five items listed
-under Deviations are minor and none of them block closing M0 once CI is exercised.
+**M0 is complete.** All 20 checklist items pass, including the three that were originally blocked
+on a CI run (items 15–17): all three platforms are green on `7fbad34`
+(https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29196998004), the vcpkg binary cache
+is proven fast on a second run (~1–2 minutes vs. 30–70 minutes cold), and zero compiler warnings
+appear in any platform's log. The five items originally listed under "Deviations from §7–§10"
+remain minor and non-blocking; the Addendum above documents three additional CI-only deviations
+discovered and fixed while exercising the pipeline for the first time, none of which touch
+product code or change M0's zero-functional-requirements scope.
