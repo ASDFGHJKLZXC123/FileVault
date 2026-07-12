@@ -27,10 +27,12 @@ jobs:
       - name: Install build tools and Qt system prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool \
-            libx11-dev libx11-xcb-dev libxext-dev libxrender-dev libxi-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libgl1-mesa-dev libglu1-mesa-dev \
-            libxrandr-dev libxcursor-dev libxdamage-dev libxinerama-dev \
+          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive autopoint automake \
+            libtool libtool-bin libltdl-dev build-essential gfortran libnuma1 libnuma-dev libudev-dev \
+            bison libbison-dev flex gperf nasm yasm swig ruby-full python3 \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrender-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev mesa-common-dev libgl1-mesa-dev libglu1-mesa-dev libgles2-mesa-dev \
+            libxrandr-dev libxcursor-dev libxdamage-dev libxinerama-dev libxaw7-dev libxt-dev libxxf86vm-dev xutils-dev \
             '^libxcb.*-dev'
 
       - name: Bootstrap pinned vcpkg
