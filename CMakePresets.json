@@ -1,0 +1,149 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF"
+      }
+    },
+    {
+      "name": "development",
+      "inherits": "base",
+      "displayName": "Development",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTING": "ON",
+        "LOCALVAULT_BUILD_GUI": "ON",
+        "LOCALVAULT_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "ON",
+        "LOCALVAULT_BUILD_GUI": "ON",
+        "LOCALVAULT_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "sanitizers",
+      "inherits": "base",
+      "displayName": "ASan and UBSan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTING": "ON",
+        "LOCALVAULT_BUILD_GUI": "OFF",
+        "LOCALVAULT_BUILD_BENCHMARKS": "OFF",
+        "LOCALVAULT_ENABLE_ASAN": "ON",
+        "LOCALVAULT_ENABLE_UBSAN": "ON"
+      }
+    },
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_CXX_EXTENSIONS": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-development",
+      "inherits": "windows-base",
+      "displayName": "Windows Development",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "LOCALVAULT_BUILD_GUI": "ON",
+        "LOCALVAULT_BUILD_BENCHMARKS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "development",
+      "configurePreset": "development"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "sanitizers",
+      "configurePreset": "sanitizers"
+    },
+    {
+      "name": "windows-development-debug",
+      "configurePreset": "windows-development",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-development-release",
+      "configurePreset": "windows-development",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "development",
+      "configurePreset": "development",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sanitizers",
+      "configurePreset": "sanitizers",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
+      }
+    },
+    {
+      "name": "windows-development-debug",
+      "configurePreset": "windows-development",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-development-release",
+      "configurePreset": "windows-development",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
