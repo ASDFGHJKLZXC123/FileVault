@@ -4,14 +4,13 @@ Date: 2026-07-13
 
 Milestone: Minimal whole-file snapshot/restore
 
-Scope: current uncommitted working tree based on `905f90e0571042a0d254fee19dece17149272673`
+Scope: exact committed tree `af78c0b10706ce1f3d4078c8423d1de7a911f2e7`
 
 ## Verdict
 
-**CODE COMPLETE, conditional on exact-head tri-platform CI.** I found no local code or test
-blocker. The checklist totals are **16 PASS, 0 FAIL, 1 PENDING**. The sole pending row is the
-combined platform gate: the macOS local suite passed, but Linux/macOS/Windows CI has not run for
-the exact committed M2 tree. This log does not certify Windows.
+**M2 GATE COMPLETE.** I found no code, test, or platform blocker. The checklist totals are
+**17 PASS, 0 FAIL, 0 PENDING**. The local verification passed, and exact-head Linux, macOS, and
+Windows CI passed for commit `af78c0b10706ce1f3d4078c8423d1de7a911f2e7`.
 
 ## Verification commands
 
@@ -31,6 +30,11 @@ the exact committed M2 tree. This log does not certify Windows.
   `git ls-files --cached --others --exclude-standard -z -- '*.cpp' '*.hpp' | xargs -0 clang-format --dry-run --Werror --style=file`.
   This included all 63 tracked and untracked C++ source/header files.
 - **PASS — whitespace:** `git diff --check`.
+- **PASS — exact-head tri-platform CI:** GitHub Actions
+  [run 29286735003](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29286735003)
+  was a successful `push` run of `build-and-test` for source commit
+  `af78c0b10706ce1f3d4078c8423d1de7a911f2e7`. All three jobs completed successfully; per-job
+  configure, build, and test steps were individually successful.
 
 ## Completion checklist
 
@@ -155,18 +159,24 @@ the exact committed M2 tree. This log does not certify Windows.
 
 ### Platform & CI
 
-- **PENDING** — Mac local suite green; all three CI jobs green. No VM session required for this
+- **PASS** — Mac local suite green; all three CI jobs green. No VM session required for this
   milestone.
 
   Local evidence is PASS: warning-strict macOS build, serial 74/74 CTest, and full 74/74 Apple
-  ASan/UBSan binary. Exact-head GitHub Actions evidence is absent because the M2 tree is still
-  uncommitted; Linux, macOS CI, and Windows remain pending. Static inspection found the intended
-  Win32 source selection and implementations for no-follow reparse-point checks, case-insensitive
-  component containment, `CREATE_NEW` temporary files, `SetFileTime`, `FlushFileBuffers`,
-  `MoveFileExW` no-replace/replace publication, and symlink privilege degradation. Static reading
-  is not Windows compilation or runtime evidence. Windows junction/mount-point source-scanner
-  classification and Windows attribute policy remain the declared later-milestone partials, not
-  claims made by this verification.
+  ASan/UBSan binary. Exact-head GitHub Actions
+  [run 29286735003](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29286735003)
+  checked out source commit `af78c0b10706ce1f3d4078c8423d1de7a911f2e7` and passed:
+
+  - **macOS:** configure 28 seconds, build 17 seconds, test step 3 seconds; 74/74 tests passed in
+    2.76 seconds; job duration 1 minute 32 seconds.
+  - **Linux:** configure 31 seconds, build 29 seconds, test step 1 second; 74/74 tests passed in
+    0.87 seconds; job duration 1 minute 45 seconds.
+  - **Windows:** configure 63 seconds, build 58 seconds, test step 12 seconds; 70/70 tests passed in
+    10.59 seconds; job duration 2 minutes 55 seconds.
+
+  The workflow completed successfully in 2 minutes 59 seconds overall. This is exact-head Windows
+  compilation and runtime evidence for the M2 tests. Windows junction/mount-point source-scanner
+  classification and Windows attribute policy remain the milestone plan's declared later partials.
 
 ### Process
 
@@ -198,10 +208,8 @@ the exact committed M2 tree. This log does not certify Windows.
 | FR-303 — alternate destination | PASS (basic) | `SnapshotRestoreAcceptanceTest.RestoresDeletedFixtureIntoNonemptyAlternateDestination` |
 | FR-309 — restore metadata/mtime | **PARTIAL** | `RestoreEngineTest.RestoresBytesEmptyEntriesAndMetadata`; `MetadataErrorsWarnWithoutSuppressingRestoredContent`; acceptance tree comparison. Nanosecond mtimes and POSIX modes are locally proven; Windows attributes remain later work. |
 
-## Blockers and follow-up gate
+## Blockers and closing gate
 
 - Code/test blockers found: **0**.
-- Required closing gate: commit the reviewed M2 tree and this log, push that exact commit, and
-  require all Linux, macOS, and Windows GitHub Actions jobs to pass. A Windows green job is required
-  before the milestone can be called complete; the static Win32 inspection above is not a
-  substitute.
+- Closing gate: **PASS** — exact source commit `af78c0b10706ce1f3d4078c8423d1de7a911f2e7`
+  passed Linux, macOS, and Windows configure/build/test jobs in GitHub Actions run 29286735003.
