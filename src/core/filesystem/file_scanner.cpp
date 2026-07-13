@@ -1,10 +1,8 @@
 #include "filesystem/file_scanner.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <exception>
-#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -75,28 +73,6 @@ namespace {
     }
 }
 
-[[nodiscard]] std::int64_t regular_modified_time_ns(const std::filesystem::path& path) {
-    std::error_code error;
-    const std::filesystem::file_time_type file_time = std::filesystem::last_write_time(path, error);
-    if (error) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to read modification time: " + error.message(), path);
-    }
-    const auto system_time = std::chrono::file_clock::to_sys(file_time);
-    const auto round_trip = std::chrono::file_clock::from_sys(system_time);
-    const std::int64_t whole =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(system_time.time_since_epoch())
-            .count();
-    const std::int64_t residual =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(file_time - round_trip).count();
-    if ((residual > 0 && whole > (std::numeric_limits<std::int64_t>::max)() - residual) ||
-        (residual < 0 && whole < (std::numeric_limits<std::int64_t>::min)() - residual)) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "file modification time is outside the supported range", path);
-    }
-    return whole + residual;
-}
-
 [[nodiscard]] std::string parent_path(std::string_view relative_path) {
     const std::size_t separator = relative_path.rfind('/');
     return separator == std::string_view::npos ? std::string{}
@@ -134,9 +110,6 @@ void add_warning(ScanResult& result, std::string relative_path, std::string code
     PlatformFileMetadata metadata;
     try {
         metadata = read_platform_file_metadata_no_follow(source_path);
-        if (type != EntryType::symbolic_link) {
-            metadata.modified_time_ns = regular_modified_time_ns(source_path);
-        }
     } catch (const LocalVaultError& error) {
         add_warning(result, std::move(relative_path), "metadata_unavailable", error.what());
         return std::nullopt;

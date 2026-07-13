@@ -66,6 +66,10 @@ Milestone: Minimal whole-file snapshot/restore
   hardening remains outside M2's minimum and must be revisited with later recovery work.
 - Serialize CMake builds in the shared multi-agent worktree. Concurrent test links once produced a
   partial generated GoogleTest discovery file even though the code was sound.
+- The first exact-head CI exposed standard-library/compiler differences absent on the development
+  Mac: Apple libc++ keeps C++20 stop tokens behind `-fexperimental-library`, GCC diagnoses omitted
+  aggregate fields under `-Werror`, and MSVC lacks `file_clock::to_sys`/`from_sys`. Keep progress
+  aggregates explicit and use the platform metadata adapter as the sole nanosecond-time source.
 - The sanitizer preset's `detect_leaks=1` is unsupported by Apple AddressSanitizer on this host;
   run the complete binary with leak detection disabled while retaining ASan and UBSan.
 

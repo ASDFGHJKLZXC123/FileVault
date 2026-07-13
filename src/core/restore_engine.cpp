@@ -504,10 +504,15 @@ void report_progress(const ProgressCallback& callback, OperationPhase phase,
     callback(ProgressEvent{
         .phase = phase,
         .current_path = path,
+        .discovered_entries = 0,
         .processed_entries = result.restored_files + result.restored_directories +
                              result.restored_symlinks + result.skipped_entries.size(),
         .processed_bytes = result.restored_bytes,
         .total_entries = total_entries,
+        .total_bytes = {},
+        .new_chunks = 0,
+        .reused_chunks = 0,
+        .message = {},
     });
 }
 

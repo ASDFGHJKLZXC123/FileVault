@@ -154,7 +154,7 @@ void TemporaryOutputFile::write(std::span<const std::byte> bytes) {
     std::size_t offset = 0;
     constexpr std::size_t maximum_write = 64U * 1024U;
     while (offset < bytes.size()) {
-        const std::size_t count = std::min(maximum_write, bytes.size() - offset);
+        const std::size_t count = (std::min)(maximum_write, bytes.size() - offset);
         DWORD written = 0;
         if (::WriteFile(impl_->handle, bytes.data() + offset, static_cast<DWORD>(count), &written,
                         nullptr) == 0) {

@@ -118,8 +118,11 @@ void report_progress(const ProgressCallback& callback, OperationPhase phase,
         .discovered_entries = discovered_entries,
         .processed_entries = totals.file_count + totals.directory_count + totals.symlink_count,
         .processed_bytes = totals.logical_size,
+        .total_entries = {},
+        .total_bytes = {},
         .new_chunks = totals.new_chunk_count,
         .reused_chunks = totals.reused_chunk_count,
+        .message = {},
     });
 }
 

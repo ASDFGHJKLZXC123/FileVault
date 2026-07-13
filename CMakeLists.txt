@@ -21,6 +21,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>")
+    add_link_options(-fexperimental-library)
+endif()
+
 file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/generated/localvault")
 configure_file(
     "${PROJECT_SOURCE_DIR}/include/localvault/version.hpp.in"
