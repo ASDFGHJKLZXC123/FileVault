@@ -3,8 +3,8 @@
 Date: 2026-07-12
 Verifier role: fresh independent verification; no implementation fixes made
 Workspace: `/Users/f8fq/dev/LocalVault`
-Verified tree state: M1 implementation is uncommitted on `main`; `HEAD` is
-`a9ac009863ae8e9c16f99f25ccbfdeb146dde305` (the M0 completion commit).
+Verified tree state: M1 is committed on `main` at
+`81a8cae191c9194d41ec036169cb33484f85aafd`.
 
 ## Local command evidence
 
@@ -165,10 +165,11 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
 
 ### Platform and process
 
-21. **PENDING — Exact-M1-commit CI.** `git status --short` shows the M1 implementation and its log
-    as modified/untracked while `HEAD` and `origin/main` are still the same M0 commit
-    `a9ac009863ae8e9c16f99f25ccbfdeb146dde305`. Therefore no exact M1 commit exists for the three CI
-    jobs to have proven; local macOS success cannot substitute for Linux/macOS/Windows CI.
+21. **PASS — Exact-M1-commit CI.** GitHub Actions run
+    [29221147241](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29221147241)
+    succeeded for exact commit `81a8cae191c9194d41ec036169cb33484f85aafd`. All configure,
+    build, and test steps were green on Windows (2m04s), Linux (1m33s), and macOS (1m18s). The run
+    page independently shows status `Success`, pushed commit `81a8cae`, and all three job durations.
 
 22. **PENDING — Windows VM manual verification.** No independent evidence was provided or produced
     for observing contention in a current Windows VM or opening a Mac-created repository read-only
@@ -198,11 +199,10 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
 
 - Evidence deviation: the strict configure is successful but reports the deprecated
   `SQLite::SQLite3` CMake target as a non-fatal author warning.
-- External evidence remains absent for exact-M1-commit tri-platform CI and both Windows VM checks.
+- External evidence remains absent only for the two Windows VM manual checks.
 
-**Totals: 23 PASS, 0 FAIL, 2 PENDING (25 rows).**
+**Totals: 24 PASS, 0 FAIL, 1 PENDING (25 rows).**
 
-**M1 gate verdict:** code-complete on the current local tree: every implementation and test row is
-PASS. M1 is not yet milestone-complete because rows 21 and 22 remain PENDING. Exact-M1-commit CI
-must pass on all three platforms and the user/Richard Windows VM checks must be recorded before M1
-can be declared milestone-complete.
+**M1 gate verdict:** code- and CI-complete: every implementation/test row passes and exact-commit
+CI is green on all three platforms. M1 is not yet milestone-complete only because row 22 remains
+PENDING; the user/Richard Windows VM checks must be recorded before M1 can be declared complete.
