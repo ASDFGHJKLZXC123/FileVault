@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <iosfwd>
 #include <span>
 #include <stop_token>
 
@@ -19,8 +20,14 @@ class Chunker final {
 
     void for_each_chunk(const std::filesystem::path& source, std::stop_token stop_token,
                         const ChunkCallback& callback) const;
+    // Narrow stream seam for deterministic read-failure tests; production uses the path overload.
+    void for_each_chunk(std::istream& input, std::stop_token stop_token,
+                        const ChunkCallback& callback) const;
 
   private:
+    void for_each_chunk(std::istream& input, const std::filesystem::path& source,
+                        std::stop_token stop_token, const ChunkCallback& callback) const;
+
     std::size_t maximum_chunk_size_{};
 };
 

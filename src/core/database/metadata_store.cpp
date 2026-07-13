@@ -1,5 +1,6 @@
 #include "database/metadata_store.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -49,6 +50,15 @@ namespace {
                               std::string(field) + " is outside the supported range");
     }
     return static_cast<std::uint64_t>(value);
+}
+
+[[nodiscard]] bool is_lowercase_blake3_hex(std::string_view value) noexcept {
+    if (value.size() != 64U) {
+        return false;
+    }
+    return std::ranges::all_of(value, [](char character) {
+        return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+    });
 }
 
 [[nodiscard]] std::string_view stored_entry_type(EntryType type) {
@@ -178,7 +188,9 @@ void MetadataStore::mark_snapshot_complete(SnapshotId snapshot_id, const Snapsho
         "symlink_count = :symlink_count, logical_size = :logical_size, "
         "new_stored_size = :new_stored_size, new_chunk_count = :new_chunk_count, "
         "reused_chunk_count = :reused_chunk_count, duration_ms = :duration_ms "
-        "WHERE id = :snapshot_id AND status = 'pending' RETURNING id");
+        "WHERE id = :snapshot_id AND status = 'pending' AND NOT EXISTS "
+        "(SELECT 1 FROM entries WHERE snapshot_id = :snapshot_id "
+        "AND entry_type = 'file' AND file_hash IS NULL) RETURNING id");
     update.bind(":completed_at_ns", completed_at_ns);
     update.bind(":file_count", checked_int64(totals.file_count, "snapshot file count"));
     update.bind(":directory_count",
@@ -271,11 +283,37 @@ std::int64_t MetadataStore::insert_entry(SnapshotId snapshot_id, const ScannedEn
     return id;
 }
 
+void MetadataStore::set_regular_file_hash(std::int64_t entry_id,
+                                          std::string_view file_hash_hex) const {
+    if (!is_lowercase_blake3_hex(file_hash_hex)) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "file hash must be exactly 64 lowercase hexadecimal characters");
+    }
+
+    auto update =
+        database_.statement("UPDATE entries SET file_hash = :file_hash WHERE id = :entry_id "
+                            "AND entry_type = 'file' AND file_hash IS NULL AND EXISTS "
+                            "(SELECT 1 FROM snapshots WHERE snapshots.id = entries.snapshot_id "
+                            "AND snapshots.status = 'pending') RETURNING id");
+    update.bind(":file_hash", file_hash_hex);
+    update.bind(":entry_id", entry_id);
+    if (!update.step()) {
+        throw LocalVaultError(
+            ErrorCode::invalid_argument,
+            "setting a file hash requires an unhashed regular file in a pending snapshot");
+    }
+    (void)update.column_int64(0);
+    if (update.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "setting a file hash updated multiple entries");
+    }
+}
+
 void MetadataStore::ensure_chunk(const StoredChunkInfo& chunk) const {
     auto insert = database_.statement(
         "INSERT INTO chunks (hash, raw_size, compressed_size, object_path, created_at_ns) "
         "VALUES (:hash, :raw_size, :stored_size, :object_path, :created_at_ns) "
-        "ON CONFLICT(hash) DO NOTHING");
+        "ON CONFLICT DO NOTHING");
     insert.bind(":hash", chunk.hash_hex);
     insert.bind(":raw_size", checked_int64(chunk.raw_size, "chunk raw size"));
     insert.bind(":stored_size", checked_int64(chunk.stored_size, "chunk stored size"));
@@ -287,8 +325,8 @@ void MetadataStore::ensure_chunk(const StoredChunkInfo& chunk) const {
         "SELECT raw_size, compressed_size, object_path FROM chunks WHERE hash = :hash");
     verify.bind(":hash", chunk.hash_hex);
     if (!verify.step()) {
-        throw LocalVaultError(ErrorCode::database_error,
-                              "chunk insertion did not leave a metadata row");
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "chunk object path conflicts with existing metadata");
     }
     const ByteCount raw_size = checked_byte_count(verify.column_int64(0), "chunk raw size");
     const ByteCount stored_size = checked_byte_count(verify.column_int64(1), "chunk stored size");
@@ -298,9 +336,36 @@ void MetadataStore::ensure_chunk(const StoredChunkInfo& chunk) const {
     }
     if (raw_size != chunk.raw_size || stored_size != chunk.stored_size ||
         object_path != chunk.object_path.generic_string()) {
-        throw LocalVaultError(ErrorCode::database_error,
+        throw LocalVaultError(ErrorCode::object_corrupt,
                               "existing chunk metadata conflicts with stored content");
     }
+}
+
+std::optional<StoredChunkInfo> MetadataStore::find_chunk(std::string_view hash_hex) const {
+    auto query = database_.statement("SELECT raw_size, compressed_size, object_path, created_at_ns "
+                                     "FROM chunks WHERE hash = :hash");
+    query.bind(":hash", hash_hex);
+    if (!query.step()) {
+        return std::nullopt;
+    }
+
+    const std::int64_t raw_size = query.column_int64(0);
+    const std::int64_t stored_size = query.column_int64(1);
+    if (raw_size <= 0 || stored_size <= 0) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "chunk metadata contains invalid object sizes");
+    }
+    StoredChunkInfo chunk{
+        .hash_hex = std::string(hash_hex),
+        .raw_size = static_cast<ByteCount>(raw_size),
+        .stored_size = static_cast<ByteCount>(stored_size),
+        .object_path = utf8_path(query.column_text(2)),
+        .created_at_ns = query.column_int64(3),
+    };
+    if (query.step()) {
+        throw LocalVaultError(ErrorCode::database_error, "chunk hash selected multiple rows");
+    }
+    return chunk;
 }
 
 void MetadataStore::insert_entry_chunk(std::int64_t entry_id, std::int64_t sequence_number,

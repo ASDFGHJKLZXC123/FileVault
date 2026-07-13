@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -16,6 +18,7 @@
 #include "filesystem/file_scanner.hpp"
 #include "localvault/error.hpp"
 #include "localvault/types.hpp"
+#include "storage/object_store.hpp"
 #include "support/test_filesystem.hpp"
 
 namespace localvault {
@@ -65,7 +68,7 @@ class StoreFixture : public ::testing::Test {
     SnapshotId snapshot_id_{};
 };
 
-TEST_F(StoreFixture, InsertsAllMetadataWithFileHashNull) {
+TEST_F(StoreFixture, InsertsPendingRegularFileWithHashNull) {
     const ScannedEntry file = entry("folder/file.txt", EntryType::regular_file, 42);
     const std::int64_t id = store_.insert_entry(snapshot_id_, file);
 
@@ -88,6 +91,41 @@ TEST_F(StoreFixture, InsertsAllMetadataWithFileHashNull) {
     ASSERT_TRUE(query.step());
     EXPECT_EQ(query.column_text(0), "null");
     EXPECT_EQ(query.column_text(1), "null");
+}
+
+TEST_F(StoreFixture, SetsOnlyAnUnhashedRegularEntryToStrictLowercaseBlake3Hex) {
+    const std::int64_t file_id =
+        store_.insert_entry(snapshot_id_, entry("file.txt", EntryType::regular_file, 3));
+    const std::int64_t directory_id =
+        store_.insert_entry(snapshot_id_, entry("folder", EntryType::directory));
+    const std::string expected_hash(64, 'a');
+
+    EXPECT_THROW(store_.set_regular_file_hash(file_id, std::string(63, 'a')), LocalVaultError);
+    EXPECT_THROW(store_.set_regular_file_hash(file_id, std::string(64, 'A')), LocalVaultError);
+    EXPECT_THROW(store_.set_regular_file_hash(file_id, std::string(64, 'g')), LocalVaultError);
+    EXPECT_THROW(store_.set_regular_file_hash(directory_id, expected_hash), LocalVaultError);
+    EXPECT_THROW(store_.set_regular_file_hash(999'999, expected_hash), LocalVaultError);
+
+    store_.set_regular_file_hash(file_id, expected_hash);
+    const std::vector<EntryInfo> entries = store_.list_entries(snapshot_id_);
+    const auto file = std::ranges::find(entries, file_id, &EntryInfo::id);
+    ASSERT_NE(file, entries.end());
+    ASSERT_TRUE(file->file_hash_hex.has_value());
+    EXPECT_EQ(*file->file_hash_hex, expected_hash);
+    EXPECT_THROW(store_.set_regular_file_hash(file_id, expected_hash), LocalVaultError);
+}
+
+TEST_F(StoreFixture, CannotCompleteSnapshotWhileARegularFileHashIsNull) {
+    const std::int64_t file_id =
+        store_.insert_entry(snapshot_id_, entry("file.txt", EntryType::regular_file, 0));
+    SnapshotTotals totals;
+    totals.file_count = 1;
+
+    EXPECT_THROW(store_.mark_snapshot_complete(snapshot_id_, totals, 2), LocalVaultError);
+    store_.set_regular_file_hash(
+        file_id, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262");
+    store_.mark_snapshot_complete(snapshot_id_, totals, 3);
+    EXPECT_EQ(store_.require_complete_snapshot(snapshot_id_).id, snapshot_id_);
 }
 
 TEST_F(StoreFixture, ListsRootChildrenWithoutReturningTheRootRow) {
@@ -173,23 +211,14 @@ TEST_F(StoreFixture, PublishesOnlyCompleteSnapshotsWithFinalCounters) {
 TEST_F(StoreFixture, StoresAndListsOrderedChunkRelationships) {
     const std::int64_t entry_id =
         store_.insert_entry(snapshot_id_, entry("file.bin", EntryType::regular_file, 5));
-    const StoredChunkInfo first{
-        .hash_hex = std::string(64, 'a'),
-        .raw_size = 3,
-        .stored_size = 3,
-        .object_path = "objects/aa/first.raw",
-        .created_at_ns = 1,
-    };
-    const StoredChunkInfo second{
-        .hash_hex = std::string(64, 'b'),
-        .raw_size = 2,
-        .stored_size = 2,
-        .object_path = "objects/bb/second.raw",
-        .created_at_ns = 2,
-    };
-    store_.ensure_chunk(first);
-    store_.ensure_chunk(second);
-    store_.ensure_chunk(first);
+    ObjectStore objects(temporary_.path(), store_, 64, 3);
+    constexpr std::array<std::byte, 3> first_raw{std::byte{1}, std::byte{2}, std::byte{3}};
+    constexpr std::array<std::byte, 2> second_raw{std::byte{4}, std::byte{5}};
+    const StoredObject first = objects.store(first_raw);
+    const StoredObject second = objects.store(second_raw);
+    EXPECT_FALSE(objects.store(first_raw).newly_stored);
+    ASSERT_TRUE(store_.find_chunk(first.hash_hex).has_value());
+    EXPECT_FALSE(store_.find_chunk(std::string(64, 'f')).has_value());
     store_.insert_entry_chunk(entry_id, 0, first.hash_hex, 0, 3);
     store_.insert_entry_chunk(entry_id, 1, second.hash_hex, 3, 2);
 
@@ -200,14 +229,25 @@ TEST_F(StoreFixture, StoresAndListsOrderedChunkRelationships) {
     EXPECT_EQ(chunks[0].raw_offset, 0U);
     EXPECT_EQ(chunks[0].raw_length, 3U);
     EXPECT_EQ(chunks[0].raw_size, 3U);
-    EXPECT_EQ(chunks[0].stored_size, 3U);
+    EXPECT_EQ(chunks[0].stored_size, first.stored_size);
+    EXPECT_EQ(chunks[0].object_path, first.relative_path);
+    EXPECT_EQ(chunks[0].object_path.extension(), ".zst");
     EXPECT_EQ(chunks[1].sequence_number, 1);
     EXPECT_EQ(chunks[1].raw_offset, 3U);
     EXPECT_EQ(chunks[1].raw_length, 2U);
+    EXPECT_EQ(chunks[1].stored_size, second.stored_size);
+    EXPECT_EQ(chunks[1].object_path, second.relative_path);
 
-    StoredChunkInfo conflict = first;
-    conflict.stored_size = 2;
-    EXPECT_THROW(store_.ensure_chunk(conflict), LocalVaultError);
+    auto conflict = database_.statement("UPDATE chunks SET raw_size = 2 WHERE hash = :hash");
+    conflict.bind(":hash", first.hash_hex);
+    conflict.execute();
+    ObjectStore cold_objects(temporary_.path(), store_, 64, 3);
+    try {
+        (void)cold_objects.store(first_raw);
+        FAIL() << "conflicting raw size unexpectedly reused";
+    } catch (const LocalVaultError& error) {
+        EXPECT_EQ(error.code(), ErrorCode::object_corrupt);
+    }
 }
 
 } // namespace

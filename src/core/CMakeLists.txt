@@ -29,8 +29,10 @@ add_library(
     repository.cpp
     restore_engine.cpp
     snapshot_engine.cpp
+    storage/blake3_hasher.cpp
     storage/chunker.cpp
     storage/object_store.cpp
+    storage/zstd_codec.cpp
     ${LOCALVAULT_PLATFORM_SOURCES}
 )
 

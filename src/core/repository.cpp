@@ -30,6 +30,8 @@
 namespace localvault {
 namespace {
 
+constexpr std::uint64_t kMaximumRepositoryChunkSize = 4ULL * 1024ULL * 1024ULL;
+
 constexpr std::uint32_t current_format_version = 1;
 
 [[nodiscard]] std::filesystem::path normalized_root(const std::filesystem::path& root) {
@@ -293,9 +295,11 @@ void validate_schema(Database& database, const std::filesystem::path& database_p
             throw LocalVaultError(ErrorCode::invalid_repository,
                                   "repository UUID must not be empty", database_path);
         }
-        if (chunk_size <= 0) {
+        if (chunk_size <= 0 ||
+            static_cast<std::uint64_t>(chunk_size) > kMaximumRepositoryChunkSize) {
             throw LocalVaultError(ErrorCode::invalid_repository,
-                                  "repository chunk size must be positive", database_path);
+                                  "repository chunk size must be between 1 byte and 4 MiB",
+                                  database_path);
         }
         if (hash_algorithm != "blake3") {
             throw LocalVaultError(ErrorCode::invalid_repository,
@@ -378,11 +382,9 @@ class Repository::Impl final {
 void Repository::create(const std::filesystem::path& requested_root,
                         const RepositoryCreateOptions& options) {
     const std::filesystem::path root = normalized_root(requested_root);
-    if (options.chunk_size_bytes == 0 ||
-        options.chunk_size_bytes >
-            static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) {
+    if (options.chunk_size_bytes == 0 || options.chunk_size_bytes > kMaximumRepositoryChunkSize) {
         throw LocalVaultError(ErrorCode::invalid_argument,
-                              "repository chunk size is outside SQLite's supported range", root);
+                              "repository chunk size must be between 1 byte and 4 MiB", root);
     }
 
     const bool root_existed = path_exists(root);

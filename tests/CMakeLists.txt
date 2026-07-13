@@ -1,11 +1,14 @@
 add_executable(
     localvault_tests
     integration/lock_contention_test.cpp
+    integration/m3_large_file_roundtrip_test.cpp
     integration/repository_test.cpp
     integration/restore_engine_test.cpp
     integration/snapshot_engine_test.cpp
     integration/snapshot_restore_acceptance_test.cpp
     support/test_filesystem.cpp
+    unit/blake3_hasher_test.cpp
+    unit/chunker_test.cpp
     unit/database_test.cpp
     unit/file_scanner_test.cpp
     unit/filesystem_classifier_test.cpp
@@ -14,6 +17,7 @@ add_executable(
     unit/object_store_test.cpp
     unit/test_filesystem_support_test.cpp
     unit/version_test.cpp
+    unit/zstd_codec_test.cpp
 )
 
 add_executable(

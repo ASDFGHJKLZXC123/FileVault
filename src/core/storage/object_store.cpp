@@ -1,56 +1,54 @@
 #include "storage/object_store.hpp"
 
-#include <blake3.h>
-
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <system_error>
+#include <utility>
 
+#include "database/metadata_store.hpp"
+#include "filesystem/platform/file_metadata.hpp"
 #include "filesystem/platform/repository_support.hpp"
 #include "localvault/error.hpp"
+#include "storage/blake3_hasher.hpp"
 
 namespace localvault {
 namespace {
 
-constexpr std::size_t digest_size = BLAKE3_OUT_LEN;
+constexpr ByteCount compressed_size_allowance = 64ULL * 1024ULL;
 
-[[nodiscard]] std::string hash_bytes(std::span<const std::byte> bytes) {
-    blake3_hasher hasher;
-    blake3_hasher_init(&hasher);
-    if (!bytes.empty()) {
-        blake3_hasher_update(&hasher, bytes.data(), bytes.size());
+void require_valid_hash(std::string_view hash_hex, ErrorCode error_code) {
+    if (hash_hex.size() != Blake3Hasher::digest_size * 2U ||
+        !std::ranges::all_of(hash_hex, [](char character) {
+            return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+        })) {
+        throw LocalVaultError(error_code, "object identifier is not lowercase BLAKE3 hexadecimal");
     }
-    std::array<std::uint8_t, digest_size> digest{};
-    blake3_hasher_finalize(&hasher, digest.data(), digest.size());
-
-    constexpr std::string_view hexadecimal = "0123456789abcdef";
-    std::string result;
-    result.reserve(digest.size() * 2U);
-    for (const std::uint8_t byte : digest) {
-        result.push_back(hexadecimal[byte >> 4U]);
-        result.push_back(hexadecimal[byte & 0x0FU]);
-    }
-    return result;
 }
 
-[[nodiscard]] bool is_valid_hash(std::string_view hash) {
-    if (hash.size() != digest_size * 2U) {
-        return false;
-    }
-    return std::ranges::all_of(hash, [](char character) {
-        return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-    });
+[[nodiscard]] std::filesystem::path derived_path(std::string_view hash_hex) {
+    return std::filesystem::path("objects") / std::string(hash_hex.substr(0, 2)) /
+           (std::string(hash_hex) + ".zst");
 }
 
-[[nodiscard]] std::filesystem::path object_relative_path(std::string_view hash) {
-    return std::filesystem::path("objects") / std::string(hash.substr(0, 2)) /
-           (std::string(hash) + ".raw");
+[[nodiscard]] std::string hash_raw(std::span<const std::byte> raw_bytes) {
+    Blake3Hasher hasher;
+    hasher.update(raw_bytes);
+    return Blake3Hasher::to_hex(hasher.finalize());
+}
+
+[[nodiscard]] std::size_t checked_maximum_chunk_size(ByteCount size) {
+    if (size == 0 || size > ObjectStore::permanent_maximum_chunk_size ||
+        size > static_cast<ByteCount>((std::numeric_limits<std::size_t>::max)())) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "repository chunk-size limit must be between 1 byte and 4 MiB");
+    }
+    return static_cast<std::size_t>(size);
 }
 
 [[nodiscard]] ByteCount checked_byte_count(std::size_t size) {
@@ -61,13 +59,54 @@ constexpr std::size_t digest_size = BLAKE3_OUT_LEN;
     return static_cast<ByteCount>(size);
 }
 
-[[nodiscard]] std::vector<std::byte> read_file(const std::filesystem::path& path,
-                                               ByteCount expected_size) {
-    if (expected_size > static_cast<ByteCount>((std::numeric_limits<std::size_t>::max)())) {
-        throw LocalVaultError(ErrorCode::object_corrupt,
-                              "stored object is larger than the supported memory range", path);
+void ensure_directory(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    if (error) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to create object directory: " + error.message(), path);
     }
-    std::vector<std::byte> bytes(static_cast<std::size_t>(expected_size));
+    const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
+    if (error || !std::filesystem::is_directory(status)) {
+        throw LocalVaultError(ErrorCode::filesystem_error, "object directory is not a directory",
+                              path);
+    }
+}
+
+[[nodiscard]] std::optional<ByteCount> regular_file_size(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory ||
+        status.type() == std::filesystem::file_type::not_found) {
+        return std::nullopt;
+    }
+    if (error) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect stored object: " + error.message(), path);
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+        throw LocalVaultError(ErrorCode::object_corrupt, "stored object path is not a regular file",
+                              path);
+    }
+
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+    if (error == std::errc::no_such_file_or_directory) {
+        return std::nullopt;
+    }
+    if (error) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to read stored object size: " + error.message(), path);
+    }
+    if (size > static_cast<std::uintmax_t>((std::numeric_limits<ByteCount>::max)())) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object size is outside the supported range", path);
+    }
+    return static_cast<ByteCount>(size);
+}
+
+[[nodiscard]] std::vector<std::byte> read_exact(const std::filesystem::path& path,
+                                                std::size_t size) {
+    std::vector<std::byte> bytes(size);
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         throw LocalVaultError(ErrorCode::object_missing, "stored object cannot be opened", path);
@@ -86,202 +125,219 @@ constexpr std::size_t digest_size = BLAKE3_OUT_LEN;
     return bytes;
 }
 
-[[nodiscard]] std::filesystem::path
-create_unique_temporary_file(const std::filesystem::path& directory, std::string_view hash) {
-    static std::atomic<std::uint64_t> sequence{0};
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        const std::filesystem::path candidate =
-            directory / (std::string(hash) + "." + std::to_string(timestamp) + "." +
-                         std::to_string(sequence.fetch_add(1)) + ".tmp");
-        try {
-            create_exclusive_file(candidate);
-        } catch (const LocalVaultError&) {
-            std::error_code exists_error;
-            if (!std::filesystem::exists(candidate, exists_error) || exists_error) {
-                throw;
-            }
-            continue;
-        }
-        try {
-            apply_restrictive_file_permissions(candidate);
-        } catch (...) {
-            std::error_code ignored;
-            std::filesystem::remove(candidate, ignored);
-            throw;
-        }
-        return candidate;
-    }
-    throw LocalVaultError(ErrorCode::filesystem_error,
-                          "failed to create a unique temporary object file", directory);
+[[nodiscard]] std::int64_t now_nanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
-
-void ensure_directory(const std::filesystem::path& path) {
-    std::error_code error;
-    std::filesystem::create_directories(path, error);
-    if (error) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to create object directory: " + error.message(), path);
-    }
-}
-
-class TemporaryObject final {
-  public:
-    explicit TemporaryObject(std::filesystem::path path) : path_(std::move(path)) {}
-    ~TemporaryObject() {
-        if (!path_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove(path_, ignored);
-        }
-    }
-
-    TemporaryObject(const TemporaryObject&) = delete;
-    TemporaryObject& operator=(const TemporaryObject&) = delete;
-
-    [[nodiscard]] const std::filesystem::path& path() const noexcept {
-        return path_;
-    }
-    void published() noexcept {
-        path_.clear();
-    }
-
-  private:
-    std::filesystem::path path_;
-};
 
 } // namespace
 
-ObjectStore::ObjectStore(std::filesystem::path repository_root)
-    : repository_root_(std::move(repository_root)) {}
+ObjectStore::ObjectStore(std::filesystem::path repository_root, MetadataStore& metadata,
+                         ByteCount maximum_chunk_size, int compression_level)
+    : ObjectStore(std::move(repository_root), maximum_chunk_size, compression_level) {
+    metadata_ = &metadata;
+}
 
-StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) const {
+ObjectStore::ObjectStore(std::filesystem::path repository_root, ByteCount maximum_chunk_size,
+                         int compression_level)
+    : repository_root_(std::move(repository_root)),
+      maximum_chunk_size_(checked_maximum_chunk_size(maximum_chunk_size)),
+      codec_(compression_level) {}
+
+std::filesystem::path ObjectStore::object_relative_path(std::string_view hash_hex) {
+    require_valid_hash(hash_hex, ErrorCode::invalid_argument);
+    return derived_path(hash_hex);
+}
+
+StoredObject ObjectStore::require_reusable(const StoredObject& known,
+                                           std::string_view expected_hash,
+                                           const std::filesystem::path& expected_relative_path,
+                                           ByteCount expected_raw_size) const {
+    const std::filesystem::path final_path = repository_root_ / expected_relative_path;
+    if (known.hash_hex != expected_hash ||
+        known.relative_path.generic_string() != expected_relative_path.generic_string()) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object metadata does not match its BLAKE3 identifier",
+                              final_path);
+    }
+    if (known.raw_size != expected_raw_size) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "existing chunk metadata has a conflicting raw size", final_path);
+    }
+    if (known.stored_size == 0 || known.stored_size > static_cast<ByteCount>(maximum_chunk_size_) +
+                                                          compressed_size_allowance) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object compressed size exceeds the safety limit", final_path);
+    }
+    const std::optional<ByteCount> actual_size = regular_file_size(final_path);
+    if (!actual_size.has_value()) {
+        throw LocalVaultError(ErrorCode::object_missing, "stored object is missing", final_path);
+    }
+    if (*actual_size != known.stored_size) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object size does not match metadata", final_path);
+    }
+    StoredObject reused = known;
+    reused.newly_stored = false;
+    return reused;
+}
+
+std::optional<StoredObject> ObjectStore::find_existing(std::string_view hash_hex,
+                                                       const std::filesystem::path& relative_path,
+                                                       ByteCount raw_size) {
+    // M3 storage is single-threaded, with no concurrent metadata mutation or GC. Cache hits can
+    // therefore skip SQLite, but immutable final-file existence and size are always rechecked.
+    const auto cached = known_objects_.find(std::string(hash_hex));
+    if (cached != known_objects_.end()) {
+        return require_reusable(cached->second, hash_hex, relative_path, raw_size);
+    }
+
+    const std::optional<StoredChunkInfo> metadata = metadata_->find_chunk(hash_hex);
+    if (metadata.has_value()) {
+        StoredObject known{metadata->hash_hex, metadata->object_path, metadata->raw_size,
+                           metadata->stored_size, false};
+        StoredObject reused = require_reusable(known, hash_hex, relative_path, raw_size);
+        known_objects_.insert_or_assign(reused.hash_hex, reused);
+        return reused;
+    }
+
+    const std::filesystem::path final_path = repository_root_ / relative_path;
+    const std::optional<ByteCount> orphan_size = regular_file_size(final_path);
+    if (!orphan_size.has_value()) {
+        return std::nullopt;
+    }
+    (void)read_verified(hash_hex, relative_path, raw_size, *orphan_size);
+    metadata_->ensure_chunk({
+        .hash_hex = std::string(hash_hex),
+        .raw_size = raw_size,
+        .stored_size = *orphan_size,
+        .object_path = relative_path,
+        .created_at_ns = now_nanoseconds(),
+    });
+    StoredObject adopted{std::string(hash_hex), relative_path, raw_size, *orphan_size, false};
+    known_objects_.insert_or_assign(adopted.hash_hex, adopted);
+    return adopted;
+}
+
+StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
+    if (metadata_ == nullptr) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "object storage requires writable metadata");
+    }
     if (raw_bytes.empty()) {
         throw LocalVaultError(ErrorCode::invalid_argument,
                               "empty files must not create stored objects");
     }
-    const std::string hash = hash_bytes(raw_bytes);
-    const std::filesystem::path relative_path = object_relative_path(hash);
-    const std::filesystem::path final_path = repository_root_ / relative_path;
+    if (raw_bytes.size() > maximum_chunk_size_) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "raw chunk exceeds the repository chunk-size limit");
+    }
+
     const ByteCount raw_size = checked_byte_count(raw_bytes.size());
-
-    std::error_code status_error;
-    const std::filesystem::file_status existing_status =
-        std::filesystem::symlink_status(final_path, status_error);
-    if (!status_error && existing_status.type() != std::filesystem::file_type::not_found) {
-        if (!std::filesystem::is_regular_file(existing_status)) {
-            throw LocalVaultError(ErrorCode::object_corrupt,
-                                  "stored object path is not a regular file", final_path);
-        }
-        (void)read_verified(hash, relative_path, raw_size, raw_size);
-        return {hash, relative_path, raw_size, raw_size, false};
-    }
-    if (status_error && status_error != std::errc::no_such_file_or_directory) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to inspect object path: " + status_error.message(),
-                              final_path);
+    const std::string hash_hex = hash_raw(raw_bytes);
+    const std::filesystem::path relative_path = derived_path(hash_hex);
+    if (std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size)) {
+        return std::move(*existing);
     }
 
+    const std::vector<std::byte> compressed = codec_.compress(raw_bytes);
+    const ByteCount stored_size = checked_byte_count(compressed.size());
+    if (stored_size == 0 ||
+        stored_size > static_cast<ByteCount>(maximum_chunk_size_) + compressed_size_allowance) {
+        throw LocalVaultError(ErrorCode::compression_error,
+                              "compressed object exceeds the configured safety limit");
+    }
+
+    const std::filesystem::path final_path = repository_root_ / relative_path;
     ensure_directory(final_path.parent_path());
     const std::filesystem::path temporary_directory = repository_root_ / "temporary" / "objects";
     ensure_directory(temporary_directory);
-    TemporaryObject temporary(create_unique_temporary_file(temporary_directory, hash));
-    {
-        std::ofstream output(temporary.path(), std::ios::binary | std::ios::trunc);
-        if (!output) {
+
+    TemporaryOutputFile temporary(temporary_directory);
+    temporary.write(compressed);
+    temporary.sync();
+    if (std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size)) {
+        return std::move(*existing);
+    }
+    const RestorePublishResult publication = temporary.publish(final_path, false);
+    if (publication == RestorePublishResult::destination_exists) {
+        std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size);
+        if (!existing.has_value()) {
             throw LocalVaultError(ErrorCode::filesystem_error,
-                                  "failed to open temporary object file", temporary.path());
+                                  "duplicate object disappeared during publication", final_path);
         }
-        std::size_t offset = 0;
-        constexpr std::size_t maximum_write = 64U * 1024U;
-        while (offset < raw_bytes.size()) {
-            const std::size_t count = std::min(maximum_write, raw_bytes.size() - offset);
-            output.write(reinterpret_cast<const char*>(raw_bytes.data() + offset),
-                         static_cast<std::streamsize>(count));
-            if (!output) {
-                throw LocalVaultError(ErrorCode::filesystem_error,
-                                      "failed to write temporary object file", temporary.path());
-            }
-            offset += count;
-        }
-        output.close();
-        if (!output) {
-            throw LocalVaultError(ErrorCode::filesystem_error,
-                                  "failed to close temporary object file", temporary.path());
-        }
+        return std::move(*existing);
     }
 
-    std::error_code rename_error;
-    std::filesystem::rename(temporary.path(), final_path, rename_error);
-    if (rename_error) {
-        std::error_code final_error;
-        const auto final_status = std::filesystem::symlink_status(final_path, final_error);
-        if (!final_error && std::filesystem::is_regular_file(final_status)) {
-            (void)read_verified(hash, relative_path, raw_size, raw_size);
-            return {hash, relative_path, raw_size, raw_size, false};
-        }
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to publish object: " + rename_error.message(), final_path);
-    }
-    temporary.published();
-    return {hash, relative_path, raw_size, raw_size, true};
+    flush_containing_directory(final_path);
+    metadata_->ensure_chunk({
+        .hash_hex = hash_hex,
+        .raw_size = raw_size,
+        .stored_size = stored_size,
+        .object_path = relative_path,
+        .created_at_ns = now_nanoseconds(),
+    });
+    known_objects_.insert_or_assign(
+        hash_hex, StoredObject{hash_hex, relative_path, raw_size, stored_size, false});
+    return {hash_hex, relative_path, raw_size, stored_size, true};
 }
 
 std::vector<std::byte> ObjectStore::read_verified(std::string_view hash_hex,
                                                   const std::filesystem::path& relative_path,
                                                   ByteCount expected_raw_size,
                                                   ByteCount expected_stored_size) const {
-    if (!is_valid_hash(hash_hex)) {
-        throw LocalVaultError(ErrorCode::object_corrupt,
-                              "stored object identifier is not lowercase BLAKE3 hexadecimal");
-    }
-    const std::filesystem::path derived = object_relative_path(hash_hex);
+    require_valid_hash(hash_hex, ErrorCode::object_corrupt);
+    const std::filesystem::path derived = derived_path(hash_hex);
     if (relative_path.generic_string() != derived.generic_string()) {
         throw LocalVaultError(ErrorCode::object_corrupt,
                               "stored object path does not match its BLAKE3 identifier",
                               relative_path);
     }
-    if (expected_raw_size != expected_stored_size) {
-        throw LocalVaultError(ErrorCode::object_corrupt,
-                              "raw M2 object has conflicting raw and stored sizes",
-                              repository_root_ / derived);
-    }
-    if (expected_raw_size == 0) {
-        throw LocalVaultError(ErrorCode::object_corrupt,
-                              "empty files must not reference stored objects",
-                              repository_root_ / derived);
-    }
-
     const std::filesystem::path object_path = repository_root_ / derived;
-    std::error_code error;
-    const std::filesystem::file_status status = std::filesystem::symlink_status(object_path, error);
-    if (error == std::errc::no_such_file_or_directory ||
-        status.type() == std::filesystem::file_type::not_found) {
-        throw LocalVaultError(ErrorCode::object_missing, "stored object is missing", object_path);
-    }
-    if (error) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to inspect stored object: " + error.message(), object_path);
-    }
-    if (!std::filesystem::is_regular_file(status)) {
-        throw LocalVaultError(ErrorCode::object_corrupt, "stored object path is not a regular file",
+    if (expected_raw_size == 0 || expected_raw_size > maximum_chunk_size_ ||
+        expected_raw_size > static_cast<ByteCount>((std::numeric_limits<std::size_t>::max)())) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object raw size exceeds the repository chunk-size limit",
                               object_path);
     }
-    const std::uintmax_t actual_size = std::filesystem::file_size(object_path, error);
-    if (error) {
-        throw LocalVaultError(ErrorCode::filesystem_error,
-                              "failed to read stored object size: " + error.message(), object_path);
+    if (expected_stored_size == 0 ||
+        expected_stored_size >
+            static_cast<ByteCount>(maximum_chunk_size_) + compressed_size_allowance ||
+        expected_stored_size > static_cast<ByteCount>((std::numeric_limits<std::size_t>::max)())) {
+        throw LocalVaultError(ErrorCode::object_corrupt,
+                              "stored object compressed size exceeds the safety limit",
+                              object_path);
     }
-    if (actual_size != expected_stored_size) {
+
+    const std::optional<ByteCount> actual_size = regular_file_size(object_path);
+    if (!actual_size.has_value()) {
+        throw LocalVaultError(ErrorCode::object_missing, "stored object is missing", object_path);
+    }
+    if (*actual_size != expected_stored_size) {
         throw LocalVaultError(ErrorCode::object_corrupt,
                               "stored object size does not match metadata", object_path);
     }
 
-    std::vector<std::byte> bytes = read_file(object_path, expected_stored_size);
-    if (bytes.size() != expected_raw_size || hash_bytes(bytes) != hash_hex) {
+    const std::vector<std::byte> compressed =
+        read_exact(object_path, static_cast<std::size_t>(expected_stored_size));
+    std::vector<std::byte> raw;
+    try {
+        raw = codec_.decompress(compressed, static_cast<std::size_t>(expected_raw_size),
+                                maximum_chunk_size_);
+    } catch (const LocalVaultError& error) {
+        if (error.code() != ErrorCode::compression_error) {
+            throw;
+        }
+        throw LocalVaultError(
+            ErrorCode::object_corrupt,
+            "stored object failed zstd verification: " + std::string(error.what()), object_path);
+    }
+    if (hash_raw(raw) != hash_hex) {
         throw LocalVaultError(ErrorCode::object_corrupt, "stored object failed BLAKE3 verification",
                               object_path);
     }
-    return bytes;
+    return raw;
 }
 
 } // namespace localvault

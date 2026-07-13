@@ -24,6 +24,7 @@
 #include "filesystem/platform/repository_support.hpp"
 #include "localvault/error.hpp"
 #include "localvault/repository.hpp"
+#include "storage/blake3_hasher.hpp"
 #include "storage/object_store.hpp"
 
 namespace localvault {
@@ -223,6 +224,26 @@ void validate_entries(const std::vector<EntryInfo>& entries) {
     if (root_count != 1U) {
         throw LocalVaultError(ErrorCode::database_error,
                               "snapshot must contain exactly one root entry");
+    }
+}
+
+[[nodiscard]] bool is_lowercase_blake3_hex(std::string_view value) noexcept {
+    return value.size() == Blake3Hasher::digest_size * 2U &&
+           std::ranges::all_of(value, [](char character) {
+               return (character >= '0' && character <= '9') ||
+                      (character >= 'a' && character <= 'f');
+           });
+}
+
+void validate_selected_file_hashes(const std::vector<const EntryInfo*>& entries) {
+    for (const EntryInfo* entry : entries) {
+        if (entry->type == EntryType::regular_file &&
+            (!entry->file_hash_hex.has_value() ||
+             !is_lowercase_blake3_hex(*entry->file_hash_hex))) {
+            throw LocalVaultError(ErrorCode::object_corrupt,
+                                  "regular-file entry has no valid BLAKE3 file hash",
+                                  entry->relative_path);
+        }
     }
 }
 
@@ -541,6 +562,7 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
     const std::vector<EntryInfo> entries = metadata.list_entries(request.snapshot_id);
     validate_entries(entries);
     std::vector<const EntryInfo*> selected = select_entries(entries, request.relative_paths);
+    validate_selected_file_hashes(selected);
 
     std::map<std::int64_t, std::vector<ChunkReferenceInfo>> chunks_by_entry;
     for (const EntryInfo* entry : selected) {
@@ -562,7 +584,8 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
     std::vector<PlannedEntry> plan = build_plan(request, destination_root, std::move(selected));
     const std::uint64_t total_entries = plan.size();
     RestoreResult result;
-    ObjectStore objects(repository_.root());
+    ObjectStore objects(repository_.root(), repository_.info().chunk_size_bytes,
+                        repository_.info().zstd_level);
     report_progress(progress, OperationPhase::restoring, destination_root, result, total_entries);
 
     for (const PlannedEntry& planned : plan) {
@@ -601,6 +624,7 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
         require_safe_ancestors(destination_root, entry.relative_path);
         TemporaryOutputFile output(destination.parent_path());
         ByteCount written = 0;
+        Blake3Hasher full_file_hasher;
         for (const ChunkReferenceInfo& chunk : chunks_by_entry.at(entry.id)) {
             check_cancelled(stop_token, entry.relative_path);
             const std::vector<std::byte> raw = objects.read_verified(
@@ -611,11 +635,17 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
                                       entry.relative_path);
             }
             output.write(raw);
+            full_file_hasher.update(raw);
             written = checked_add(written, chunk.raw_length, entry.relative_path);
         }
         if (written != entry.logical_size) {
             throw LocalVaultError(ErrorCode::object_corrupt,
                                   "restored file size does not match snapshot metadata",
+                                  entry.relative_path);
+        }
+        if (Blake3Hasher::to_hex(full_file_hasher.finalize()) != *entry.file_hash_hex) {
+            throw LocalVaultError(ErrorCode::object_corrupt,
+                                  "restored file failed full-file BLAKE3 verification",
                                   entry.relative_path);
         }
         output.sync();
@@ -706,7 +736,6 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
 
     report_progress(progress, OperationPhase::complete, destination_root, result, total_entries);
     (void)writer_lock;
-    (void)request.verify_final_file_hash;
     return result;
 }
 

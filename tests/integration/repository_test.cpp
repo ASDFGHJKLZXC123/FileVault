@@ -87,6 +87,29 @@ TEST(RepositoryTest, CreateAndOpenRoundTripPreservesRepositoryInformation) {
     EXPECT_FALSE(read_only.info().repository_uuid.empty());
 }
 
+TEST(RepositoryTest, ChunkSizeMetadataIsPermanentlyBoundedByFourMiB) {
+    TemporaryDirectory temporary;
+    const std::filesystem::path zero_root = temporary.path() / "zero";
+    const std::filesystem::path oversized_root = temporary.path() / "oversized";
+    RepositoryCreateOptions options;
+
+    options.chunk_size_bytes = 0;
+    EXPECT_THROW(Repository::create(zero_root, options), LocalVaultError);
+    EXPECT_FALSE(std::filesystem::exists(zero_root));
+
+    options.chunk_size_bytes = 4ULL * 1024ULL * 1024ULL + 1ULL;
+    EXPECT_THROW(Repository::create(oversized_root, options), LocalVaultError);
+    EXPECT_FALSE(std::filesystem::exists(oversized_root));
+
+    const std::filesystem::path corrupt_root = temporary.path() / "corrupt";
+    Repository::create(corrupt_root);
+    {
+        Database database(corrupt_root / "repository.db");
+        database.execute("UPDATE repository_info SET chunk_size_bytes = 4194305");
+    }
+    expect_invalid_repository(corrupt_root);
+}
+
 TEST(RepositoryTest, RandomDirectoryIsNotARepository) {
     TemporaryDirectory temporary;
     std::ofstream(temporary.path() / "unrelated.txt") << "user data";

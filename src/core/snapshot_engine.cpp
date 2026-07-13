@@ -14,6 +14,7 @@
 #include "filesystem/platform/platform_lock.hpp"
 #include "localvault/error.hpp"
 #include "localvault/repository.hpp"
+#include "storage/blake3_hasher.hpp"
 #include "storage/chunker.hpp"
 #include "storage/object_store.hpp"
 
@@ -185,7 +186,8 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
         }
 
         Chunker chunker(repository_.info().chunk_size_bytes);
-        ObjectStore objects(repository_.root());
+        ObjectStore objects(repository_.root(), metadata, repository_.info().chunk_size_bytes,
+                            repository_.info().zstd_level);
         const std::uint64_t discovered_entries = scan.entries.size();
         for (const ScannedEntry& entry : scan.entries) {
             check_cancelled(stop_token, entry.source_path);
@@ -204,19 +206,14 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
                 add_bytes(totals.logical_size, entry.logical_size, "logical size");
                 std::uint64_t sequence = 0;
                 ByteCount bytes_read = 0;
+                Blake3Hasher full_file_hasher;
                 report_progress(progress, OperationPhase::reading, entry.source_path, totals,
                                 discovered_entries);
                 chunker.for_each_chunk(
                     entry.source_path, stop_token,
                     [&](ByteCount raw_offset, std::span<const std::byte> raw_bytes) {
+                        full_file_hasher.update(raw_bytes);
                         const StoredObject stored = objects.store(raw_bytes);
-                        metadata.ensure_chunk({
-                            .hash_hex = stored.hash_hex,
-                            .raw_size = stored.raw_size,
-                            .stored_size = stored.stored_size,
-                            .object_path = stored.relative_path,
-                            .created_at_ns = now_ns(),
-                        });
                         metadata.insert_entry_chunk(entry_id, checked_sequence(sequence),
                                                     stored.hash_hex, raw_offset, stored.raw_size);
                         ++sequence;
@@ -234,6 +231,8 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
                                           "source file size changed while reading",
                                           entry.source_path);
                 }
+                metadata.set_regular_file_hash(entry_id,
+                                               Blake3Hasher::to_hex(full_file_hasher.finalize()));
                 break;
             }
             }

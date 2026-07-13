@@ -19,6 +19,7 @@
 #include "localvault/error.hpp"
 #include "localvault/repository.hpp"
 #include "localvault/snapshot_engine.hpp"
+#include "storage/blake3_hasher.hpp"
 #include "storage/object_store.hpp"
 #include "support/test_filesystem.hpp"
 
@@ -43,11 +44,18 @@ namespace {
     return entry == entries.end() ? nullptr : &*entry;
 }
 
-[[nodiscard]] std::uint64_t count_raw_objects(const std::filesystem::path& repository_root) {
+[[nodiscard]] bool is_lowercase_blake3_hex(std::string_view value) {
+    return value.size() == 64U && std::ranges::all_of(value, [](char character) {
+               return (character >= '0' && character <= '9') ||
+                      (character >= 'a' && character <= 'f');
+           });
+}
+
+[[nodiscard]] std::uint64_t count_zstd_objects(const std::filesystem::path& repository_root) {
     std::uint64_t count = 0;
     for (const auto& entry :
          std::filesystem::recursive_directory_iterator(repository_root / "objects")) {
-        if (entry.is_regular_file() && entry.path().extension() == ".raw") {
+        if (entry.is_regular_file() && entry.path().extension() == ".zst") {
             ++count;
         }
     }
@@ -63,7 +71,7 @@ namespace {
     return query.column_text(0);
 }
 
-TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedRawChunks) {
+TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedZstdChunksAndFileHashes) {
     test::TemporaryDirectory temporary;
     const std::filesystem::path source = temporary.path() / "source";
     const std::filesystem::path repository_root = temporary.path() / "repository";
@@ -147,7 +155,9 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedRawChunks) {
     const EntryInfo* empty_file = find_entry(entries, "empty file");
     ASSERT_NE(empty_file, nullptr);
     EXPECT_TRUE(metadata.list_entry_chunks(empty_file->id).empty());
-    EXPECT_FALSE(empty_file->file_hash_hex.has_value());
+    ASSERT_TRUE(empty_file->file_hash_hex.has_value());
+    EXPECT_EQ(*empty_file->file_hash_hex,
+              "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262");
     if (symlink_created) {
         const EntryInfo* link = find_entry(entries, "broken link");
         ASSERT_NE(link, nullptr);
@@ -155,13 +165,16 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedRawChunks) {
         EXPECT_EQ(path_utf8(*link->symlink_target), "missing target");
     }
 
-    ObjectStore objects(repository_root);
+    ObjectStore objects(repository_root, create_options.chunk_size_bytes,
+                        create_options.zstd_level);
     std::uint64_t total_references = 0;
+    bool saw_compressed_size_difference = false;
     for (const EntryInfo& entry : entries) {
         if (entry.type != EntryType::regular_file) {
             continue;
         }
-        EXPECT_FALSE(entry.file_hash_hex.has_value());
+        ASSERT_TRUE(entry.file_hash_hex.has_value());
+        EXPECT_TRUE(is_lowercase_blake3_hex(*entry.file_hash_hex));
         const std::vector<ChunkReferenceInfo> chunks = metadata.list_entry_chunks(entry.id);
         std::vector<std::byte> reconstructed;
         ByteCount expected_offset = 0;
@@ -171,9 +184,11 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedRawChunks) {
             EXPECT_EQ(chunk.raw_offset, expected_offset);
             EXPECT_LE(chunk.raw_length, create_options.chunk_size_bytes);
             EXPECT_EQ(chunk.raw_length, chunk.raw_size);
-            EXPECT_EQ(chunk.raw_size, chunk.stored_size);
+            EXPECT_GT(chunk.stored_size, 0U);
+            saw_compressed_size_difference =
+                saw_compressed_size_difference || chunk.raw_size != chunk.stored_size;
             EXPECT_EQ(chunk.hash_hex.size(), 64U);
-            EXPECT_EQ(chunk.object_path.extension(), ".raw");
+            EXPECT_EQ(chunk.object_path.extension(), ".zst");
             const auto raw = objects.read_verified(chunk.hash_hex, chunk.object_path,
                                                    chunk.raw_size, chunk.stored_size);
             reconstructed.insert(reconstructed.end(), raw.begin(), raw.end());
@@ -181,9 +196,14 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedRawChunks) {
             ++total_references;
         }
         EXPECT_EQ(reconstructed, test::read_all_bytes(source / entry.relative_path));
+        Blake3Hasher full_file_hasher;
+        full_file_hasher.update(reconstructed);
+        EXPECT_EQ(*entry.file_hash_hex, Blake3Hasher::to_hex(full_file_hasher.finalize()));
+        EXPECT_EQ(expected_offset, entry.logical_size);
     }
+    EXPECT_TRUE(saw_compressed_size_difference);
     EXPECT_EQ(total_references, result.new_chunks + result.reused_chunks);
-    EXPECT_EQ(count_raw_objects(repository_root), result.new_chunks);
+    EXPECT_EQ(count_zstd_objects(repository_root), result.new_chunks);
 
     auto warning_count = database.statement(
         "SELECT COUNT(*) FROM snapshot_warnings WHERE snapshot_id = :snapshot_id");

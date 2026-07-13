@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -11,6 +12,7 @@
 namespace localvault {
 
 class Database;
+class ObjectStore;
 struct ScannedEntry;
 
 struct SnapshotTotals {
@@ -58,7 +60,8 @@ class MetadataStore final {
 
     [[nodiscard]] std::int64_t insert_entry(SnapshotId snapshot_id,
                                             const ScannedEntry& entry) const;
-    void ensure_chunk(const StoredChunkInfo& chunk) const;
+    void set_regular_file_hash(std::int64_t entry_id, std::string_view file_hash_hex) const;
+    [[nodiscard]] std::optional<StoredChunkInfo> find_chunk(std::string_view hash_hex) const;
     void insert_entry_chunk(std::int64_t entry_id, std::int64_t sequence_number,
                             std::string_view chunk_hash, ByteCount raw_offset,
                             ByteCount raw_length) const;
@@ -70,6 +73,10 @@ class MetadataStore final {
     [[nodiscard]] std::vector<ChunkReferenceInfo> list_entry_chunks(std::int64_t entry_id) const;
 
   private:
+    friend class ObjectStore;
+
+    void ensure_chunk(const StoredChunkInfo& chunk) const;
+
     Database& database_;
 };
 

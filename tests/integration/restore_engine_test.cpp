@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -9,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +31,7 @@
 #include "localvault/restore_engine.hpp"
 #include "localvault/snapshot_engine.hpp"
 #include "localvault/types.hpp"
+#include "storage/zstd_codec.hpp"
 #include "support/test_filesystem.hpp"
 
 namespace localvault {
@@ -36,6 +40,14 @@ namespace {
 [[nodiscard]] std::string read_text(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void write_bytes(const std::filesystem::path& path, std::span<const std::byte> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output) << path;
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output) << path;
 }
 
 class RestoreEngineTest : public ::testing::Test {
@@ -379,6 +391,120 @@ TEST_F(RestoreEngineTest, CorruptObjectCannotReplaceExistingDestination) {
     EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
 }
 
+TEST_F(RestoreEngineTest, ValidZstdFrameWithWrongRawBytesFailsChunkHashBeforePublication) {
+    const std::filesystem::path source = temporary_.path() / "source-valid-wrong-frame";
+    constexpr std::string_view original = "snapshot bytes";
+    test::DatasetBuilder(source).text_file("file.txt", original);
+    const SnapshotId snapshot_id = snapshot(source);
+    Database database(repository_root() / "repository.db");
+    auto object =
+        database.statement("SELECT c.hash, c.object_path FROM chunks AS c JOIN entry_chunks AS ec "
+                           "ON ec.chunk_hash = c.hash JOIN entries AS e ON e.id = ec.entry_id "
+                           "WHERE e.snapshot_id = :snapshot_id AND e.relative_path = 'file.txt'");
+    object.bind(":snapshot_id", snapshot_id);
+    ASSERT_TRUE(object.step());
+    const std::string hash = object.column_text(0);
+    const std::filesystem::path object_path = repository_root() / object.column_text(1);
+    ASSERT_FALSE(object.step());
+
+    std::vector<std::byte> wrong_raw(original.size(), std::byte{0x7E});
+    const std::vector<std::byte> compressed =
+        ZstdCodec(repository_->info().zstd_level).compress(wrong_raw);
+    write_bytes(object_path, compressed);
+    auto update =
+        database.statement("UPDATE chunks SET compressed_size = :size WHERE hash = :hash");
+    update.bind(":size", static_cast<std::int64_t>(compressed.size()));
+    update.bind(":hash", hash);
+    update.execute();
+
+    const std::filesystem::path destination = destination_path("valid-wrong-frame-destination");
+    test::DatasetBuilder(destination).text_file("file.txt", "existing bytes");
+    try {
+        (void)RestoreEngine(*repository_)
+            .restore({.snapshot_id = snapshot_id,
+                      .relative_paths = {},
+                      .destination_root = destination,
+                      .overwrite_policy = OverwritePolicy::always,
+                      .conflict_resolver = {}});
+        FAIL() << "wrong raw bytes unexpectedly restored";
+    } catch (const LocalVaultError& error) {
+        EXPECT_EQ(error.code(), ErrorCode::object_corrupt);
+    }
+    EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
+}
+
+TEST_F(RestoreEngineTest, TruncatedObjectCannotReplaceExistingDestination) {
+    const std::filesystem::path source = temporary_.path() / "source-truncated";
+    test::DatasetBuilder(source).text_file("file.txt", "snapshot bytes");
+    const SnapshotId snapshot_id = snapshot(source);
+    std::filesystem::path object_path;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(repository_root() / "objects")) {
+        if (entry.is_regular_file()) {
+            object_path = entry.path();
+        }
+    }
+    ASSERT_FALSE(object_path.empty());
+    const std::uintmax_t original_size = std::filesystem::file_size(object_path);
+    ASSERT_GT(original_size, 1U);
+    test::truncate_file(object_path, original_size - 1U);
+    const std::filesystem::path destination = destination_path("truncated-destination");
+    test::DatasetBuilder(destination).text_file("file.txt", "existing bytes");
+
+    EXPECT_THROW((void)RestoreEngine(*repository_)
+                     .restore({.snapshot_id = snapshot_id,
+                               .relative_paths = {},
+                               .destination_root = destination,
+                               .overwrite_policy = OverwritePolicy::always,
+                               .conflict_resolver = {}}),
+                 LocalVaultError);
+    EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
+}
+
+TEST_F(RestoreEngineTest,
+       MissingInvalidAndWrongFileHashesFailEvenWhenFinalVerificationFlagIsFalse) {
+    const std::filesystem::path source = temporary_.path() / "source-file-hash";
+    test::DatasetBuilder(source).text_file("file.txt", "snapshot bytes");
+    const SnapshotId snapshot_id = snapshot(source);
+    Database database(repository_root() / "repository.db");
+    auto id_query = database.statement(
+        "SELECT id FROM entries WHERE snapshot_id = :snapshot_id AND relative_path = 'file.txt'");
+    id_query.bind(":snapshot_id", snapshot_id);
+    ASSERT_TRUE(id_query.step());
+    const std::int64_t entry_id = id_query.column_int64(0);
+    ASSERT_FALSE(id_query.step());
+
+    const std::filesystem::path destination = destination_path("file-hash-destination");
+    test::DatasetBuilder(destination).text_file("file.txt", "existing bytes");
+    const std::array<std::optional<std::string>, 3> corrupt_hashes{
+        std::nullopt, std::string("invalid"), std::string(64, '0')};
+    for (const std::optional<std::string>& corrupt_hash : corrupt_hashes) {
+        auto update =
+            database.statement("UPDATE entries SET file_hash = :file_hash WHERE id = :entry_id");
+        if (corrupt_hash.has_value()) {
+            update.bind(":file_hash", *corrupt_hash);
+        } else {
+            update.bind_null(":file_hash");
+        }
+        update.bind(":entry_id", entry_id);
+        update.execute();
+
+        try {
+            (void)RestoreEngine(*repository_)
+                .restore({.snapshot_id = snapshot_id,
+                          .relative_paths = {},
+                          .destination_root = destination,
+                          .overwrite_policy = OverwritePolicy::always,
+                          .conflict_resolver = {},
+                          .verify_final_file_hash = false});
+            FAIL() << "corrupt full-file hash unexpectedly restored";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::object_corrupt);
+        }
+        EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
+    }
+}
+
 TEST_F(RestoreEngineTest, RejectsMalformedChunkLayoutsBeforePublication) {
     const std::filesystem::path source = temporary_.path() / "source";
     test::DatasetBuilder(source).text_file("file.txt", "four");
@@ -434,6 +560,14 @@ TEST_F(RestoreEngineTest, RejectsMalformedChunkLayoutsBeforePublication) {
 
     update("UPDATE entries SET logical_size = :value WHERE id = :entry_id", 5);
     expect_rejected("logical-size-mismatch");
+    update("UPDATE entries SET logical_size = :value WHERE id = :entry_id", 4);
+
+    const std::int64_t oversized_stored =
+        static_cast<std::int64_t>(repository_->info().chunk_size_bytes * 2U);
+    update("UPDATE chunks SET compressed_size = :value WHERE hash = (SELECT chunk_hash FROM "
+           "entry_chunks WHERE entry_id = :entry_id)",
+           oversized_stored);
+    expect_rejected("oversized-compressed-object");
 }
 
 #ifndef _WIN32
