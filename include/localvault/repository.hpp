@@ -7,6 +7,7 @@
 
 namespace localvault {
 
+class Database;
 class FailureInjector;
 
 struct RepositoryCreateOptions {
@@ -49,6 +50,8 @@ class Repository final {
   private:
     class Impl;
     explicit Repository(std::unique_ptr<Impl> impl);
+    [[nodiscard]] Database& database() noexcept;
+    [[nodiscard]] OpenMode open_mode() const noexcept;
     std::unique_ptr<Impl> impl_;
 
     friend class SnapshotEngine;

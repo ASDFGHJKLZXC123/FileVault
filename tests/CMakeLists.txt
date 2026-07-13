@@ -2,9 +2,17 @@ add_executable(
     localvault_tests
     integration/lock_contention_test.cpp
     integration/repository_test.cpp
+    integration/restore_engine_test.cpp
+    integration/snapshot_engine_test.cpp
+    integration/snapshot_restore_acceptance_test.cpp
+    support/test_filesystem.cpp
     unit/database_test.cpp
+    unit/file_scanner_test.cpp
     unit/filesystem_classifier_test.cpp
+    unit/metadata_store_test.cpp
     unit/migrations_test.cpp
+    unit/object_store_test.cpp
+    unit/test_filesystem_support_test.cpp
     unit/version_test.cpp
 )
 
@@ -47,6 +55,7 @@ target_include_directories(
     localvault_tests
     PRIVATE
         "${PROJECT_SOURCE_DIR}/src/core"
+        "${PROJECT_SOURCE_DIR}/tests"
 )
 
 target_compile_definitions(

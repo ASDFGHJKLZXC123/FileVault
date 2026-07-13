@@ -363,12 +363,15 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
 
 class Repository::Impl final {
   public:
-    Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database> database)
-        : root_(std::move(root)), info_(std::move(info)), database_(std::move(database)) {}
+    Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database> database,
+         OpenMode mode)
+        : root_(std::move(root)), info_(std::move(info)), database_(std::move(database)),
+          mode_(mode) {}
 
     std::filesystem::path root_;
     RepositoryInfo info_;
     std::unique_ptr<Database> database_;
+    OpenMode mode_;
     std::shared_ptr<FailureInjector> failure_injector_;
 };
 
@@ -598,7 +601,7 @@ Repository Repository::open(const std::filesystem::path& requested_root, OpenMod
     const DatabaseAccess access = database_access_for_open(root, mode);
     auto database = std::make_unique<Database>(database_path, access);
     RepositoryInfo info = load_repository_info(*database, database_path);
-    return Repository(std::make_unique<Impl>(root, std::move(info), std::move(database)));
+    return Repository(std::make_unique<Impl>(root, std::move(info), std::move(database), mode));
 }
 
 Repository::Repository(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -616,6 +619,14 @@ std::uint32_t Repository::format_version() const noexcept {
 
 const RepositoryInfo& Repository::info() const noexcept {
     return impl_->info_;
+}
+
+Database& Repository::database() noexcept {
+    return *impl_->database_;
+}
+
+OpenMode Repository::open_mode() const noexcept {
+    return impl_->mode_;
 }
 
 void Repository::set_failure_injector(std::shared_ptr<FailureInjector> injector) {
