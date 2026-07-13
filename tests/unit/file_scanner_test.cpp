@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -65,7 +64,8 @@ TEST(FileScannerTest, EmitsRootFilesDirectoriesHiddenAndExactUnicodePaths) {
     ASSERT_FALSE(on_disk_unicode_name.empty());
 
     const std::filesystem::file_time_type requested_time =
-        std::filesystem::file_time_type::clock::now() + std::chrono::nanoseconds{123};
+        std::filesystem::file_time_type::clock::now() +
+        std::filesystem::file_time_type::duration{1};
     const std::filesystem::path timed_file = source / "nested/file with spaces.txt";
     std::filesystem::last_write_time(timed_file, requested_time);
     const std::int64_t expected_time =
