@@ -83,8 +83,10 @@ TEST_F(RestoreEngineTest, RestoresBytesEmptyEntriesAndMetadata) {
     const RestoreResult result = RestoreEngine(*repository_)
                                      .restore({
                                          .snapshot_id = snapshot_id,
+                                         .relative_paths = {},
                                          .destination_root = destination,
                                          .overwrite_policy = OverwritePolicy::never,
+                                         .conflict_resolver = {},
                                      });
 
     EXPECT_EQ(result.restored_files, 3U);
@@ -114,7 +116,9 @@ TEST_F(RestoreEngineTest, RestoresBrokenSymlinkTextWithoutFollowingTarget) {
     const RestoreResult result = RestoreEngine(*repository_)
                                      .restore({
                                          .snapshot_id = snapshot_id,
+                                         .relative_paths = {},
                                          .destination_root = destination,
+                                         .conflict_resolver = {},
                                      });
 
     EXPECT_EQ(result.restored_symlinks, 1U);
@@ -135,8 +139,10 @@ TEST_F(RestoreEngineTest, NeverPreservesExistingConflictsAndUnrelatedFiles) {
     const RestoreResult result = RestoreEngine(*repository_)
                                      .restore({
                                          .snapshot_id = snapshot_id,
+                                         .relative_paths = {},
                                          .destination_root = destination,
                                          .overwrite_policy = OverwritePolicy::never,
+                                         .conflict_resolver = {},
                                      });
 
     EXPECT_EQ(read_text(destination / "conflict.txt"), "existing");
@@ -176,6 +182,7 @@ TEST_F(RestoreEngineTest, RestoresOneFileOrOneDirectoryRecursively) {
             .snapshot_id = snapshot_id,
             .relative_paths = {"folder/one.txt"},
             .destination_root = file_destination,
+            .conflict_resolver = {},
         });
     EXPECT_TRUE(std::filesystem::is_regular_file(file_destination / "folder/one.txt"));
     EXPECT_FALSE(std::filesystem::exists(file_destination / "folder/nested"));
@@ -187,6 +194,7 @@ TEST_F(RestoreEngineTest, RestoresOneFileOrOneDirectoryRecursively) {
             .snapshot_id = snapshot_id,
             .relative_paths = {"folder"},
             .destination_root = directory_destination,
+            .conflict_resolver = {},
         });
     EXPECT_EQ(read_text(directory_destination / "folder/one.txt"), "one");
     EXPECT_EQ(read_text(directory_destination / "folder/nested/two.txt"), "two");
@@ -202,7 +210,9 @@ TEST_F(RestoreEngineTest, RejectsIncompleteSnapshotBeforeWritingDestination) {
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = pending,
+                         .relative_paths = {},
                          .destination_root = destination,
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_FALSE(std::filesystem::exists(destination));
@@ -215,7 +225,9 @@ TEST_F(RestoreEngineTest, RejectsReadOnlyRepositoryBeforeWritingDestination) {
 
     EXPECT_THROW((void)RestoreEngine(read_only).restore({
                      .snapshot_id = 1,
+                     .relative_paths = {},
                      .destination_root = destination,
+                     .conflict_resolver = {},
                  }),
                  LocalVaultError);
     EXPECT_FALSE(std::filesystem::exists(destination));
@@ -238,7 +250,9 @@ TEST_F(RestoreEngineTest, RejectsTraversalMetadataWithoutWritingOutsideDestinati
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = snapshot_id,
+                         .relative_paths = {},
                          .destination_root = destination,
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_FALSE(std::filesystem::exists(temporary_.path() / "escape"));
@@ -261,7 +275,9 @@ TEST_F(RestoreEngineTest, RejectsDestinationBelowSymlinkWithoutMutatingItsTarget
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = snapshot_id,
+                         .relative_paths = {},
                          .destination_root = link / "below-link",
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_TRUE(std::filesystem::is_empty(target));
@@ -274,7 +290,9 @@ TEST_F(RestoreEngineTest, RejectsDifferentlyCasedRepositoryDestinationAlias) {
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = 1,
+                         .relative_paths = {},
                          .destination_root = temporary_.path() / "REPOSITORY" / "destination",
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_FALSE(std::filesystem::exists(repository_root() / "destination"));
@@ -298,7 +316,9 @@ TEST_F(RestoreEngineTest, RejectsDestinationBelowWindowsJunction) {
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = snapshot_id,
+                         .relative_paths = {},
                          .destination_root = junction / "below-junction",
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     std::error_code error;
@@ -323,7 +343,9 @@ TEST_F(RestoreEngineTest, RejectsDestinationWhenRepositorySharesSymlinkAncestor)
     EXPECT_THROW((void)RestoreEngine(shared_repository)
                      .restore({
                          .snapshot_id = 1,
+                         .relative_paths = {},
                          .destination_root = link / "destination",
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_FALSE(std::filesystem::exists(target / "destination"));
@@ -348,8 +370,10 @@ TEST_F(RestoreEngineTest, CorruptObjectCannotReplaceExistingDestination) {
     EXPECT_THROW((void)RestoreEngine(*repository_)
                      .restore({
                          .snapshot_id = snapshot_id,
+                         .relative_paths = {},
                          .destination_root = destination,
                          .overwrite_policy = OverwritePolicy::always,
+                         .conflict_resolver = {},
                      }),
                  LocalVaultError);
     EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
@@ -378,7 +402,9 @@ TEST_F(RestoreEngineTest, RejectsMalformedChunkLayoutsBeforePublication) {
         EXPECT_THROW((void)RestoreEngine(*repository_)
                          .restore({
                              .snapshot_id = snapshot_id,
+                             .relative_paths = {},
                              .destination_root = destination,
+                             .conflict_resolver = {},
                          }),
                      LocalVaultError);
         EXPECT_FALSE(std::filesystem::exists(destination / "file.txt"));
@@ -431,7 +457,9 @@ TEST_F(RestoreEngineTest, MetadataErrorsWarnWithoutSuppressingRestoredContent) {
     const RestoreResult result = RestoreEngine(*repository_)
                                      .restore({
                                          .snapshot_id = snapshot_id,
+                                         .relative_paths = {},
                                          .destination_root = destination,
+                                         .conflict_resolver = {},
                                      });
 
     EXPECT_EQ(read_text(destination / "bad-file.txt"), "bad file bytes");

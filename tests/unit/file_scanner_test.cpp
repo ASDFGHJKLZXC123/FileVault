@@ -13,6 +13,7 @@
 #endif
 
 #include "filesystem/file_scanner.hpp"
+#include "filesystem/platform/file_metadata.hpp"
 #include "localvault/error.hpp"
 #include "localvault/types.hpp"
 #include "support/test_filesystem.hpp"
@@ -63,16 +64,12 @@ TEST(FileScannerTest, EmitsRootFilesDirectoriesHiddenAndExactUnicodePaths) {
     }
     ASSERT_FALSE(on_disk_unicode_name.empty());
 
-    const auto requested_time = std::chrono::file_clock::now() + std::chrono::nanoseconds{123};
-    std::filesystem::last_write_time(source / "nested/file with spaces.txt", requested_time);
-    const auto actual_file_time =
-        std::filesystem::last_write_time(source / "nested/file with spaces.txt");
-    const auto system_time = std::chrono::file_clock::to_sys(actual_file_time);
-    const auto round_trip = std::chrono::file_clock::from_sys(system_time);
+    const std::filesystem::file_time_type requested_time =
+        std::filesystem::file_time_type::clock::now() + std::chrono::nanoseconds{123};
+    const std::filesystem::path timed_file = source / "nested/file with spaces.txt";
+    std::filesystem::last_write_time(timed_file, requested_time);
     const std::int64_t expected_time =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(system_time.time_since_epoch())
-            .count() +
-        std::chrono::duration_cast<std::chrono::nanoseconds>(actual_file_time - round_trip).count();
+        read_platform_file_metadata_no_follow(timed_file).modified_time_ns;
 
     const ScanResult result = FileScanner{}.scan(source);
 

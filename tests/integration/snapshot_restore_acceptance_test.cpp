@@ -159,8 +159,10 @@ TEST(SnapshotRestoreAcceptanceTest, RestoresDeletedFixtureIntoNonemptyAlternateD
     const RestoreResult restored = RestoreEngine(repository)
                                        .restore({
                                            .snapshot_id = snapshot.snapshot_id,
+                                           .relative_paths = {},
                                            .destination_root = requested_destination,
                                            .overwrite_policy = OverwritePolicy::never,
+                                           .conflict_resolver = {},
                                        });
 
     EXPECT_EQ(restored.restored_files, snapshot.file_count);
