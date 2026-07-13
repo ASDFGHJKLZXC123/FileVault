@@ -1,6 +1,27 @@
+if(WIN32)
+    set(
+        LOCALVAULT_PLATFORM_SOURCES
+        filesystem/platform/win32_lock.cpp
+        filesystem/platform/win32_repository_support.cpp
+    )
+else()
+    set(
+        LOCALVAULT_PLATFORM_SOURCES
+        filesystem/platform/posix_lock.cpp
+        filesystem/platform/posix_repository_support.cpp
+    )
+endif()
+
 add_library(
     localvault_core
     core.cpp
+    database/database.cpp
+    database/migrations.cpp
+    database/statement.cpp
+    database/transaction.cpp
+    filesystem/filesystem_classifier.cpp
+    repository.cpp
+    ${LOCALVAULT_PLATFORM_SOURCES}
 )
 
 add_library(LocalVault::core ALIAS localvault_core)
@@ -13,6 +34,8 @@ target_include_directories(
         "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
         "$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/generated>"
         "$<INSTALL_INTERFACE:include>"
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(
@@ -22,6 +45,10 @@ target_link_libraries(
         LocalVault::blake3
         LocalVault::zstd
 )
+
+if(WIN32)
+    target_link_libraries(localvault_core PRIVATE bcrypt)
+endif()
 
 localvault_set_warnings(localvault_core)
 localvault_enable_sanitizers(localvault_core)
