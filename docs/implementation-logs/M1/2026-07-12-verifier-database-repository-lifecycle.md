@@ -177,22 +177,20 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
     build, and test steps were green on Windows (2m04s), Linux (1m33s), and macOS (1m18s). The run
     page independently shows status `Success`, pushed commit `81a8cae`, and all three job durations.
 
-22. **PENDING — Windows VM manual verification (one of two checks complete).** **User-reported
-    PASS — live lock contention:** the user reports running every supplied Windows command,
+22. **PASS — Windows manual verification.** **User-reported PASS — live lock contention:** the user
+    reports running every supplied Windows command,
     including configure, build, full CTest, and the focused verbose
     `RepositoryLockIntegrationTest.SecondProcessReceivesRepositoryBusy`; this satisfies the live
-    Windows contention half of the manual gate. **PENDING — cross-platform read-only open:** the
-    Mac-created repository archive has not yet been opened read-only on Windows, so the checklist
-    row remains PENDING. The new `localvault_repository_probe` genuinely enables that check: its
-    `create` command persists a repository and immediately validates it read-only, while
-    `open-read-only` calls `Repository::open(..., OpenMode::read_only)` and prints UUID, format
-    version, chunk size, zstd level, and hash algorithm for comparison
-    (`tests/support/repository_probe.cpp:16-45`). Its Win32 `wmain` accepts the same commands and a
-    native Windows path (`tests/support/repository_probe.cpp:49-64`), and CMake builds/links the
-    helper with `LocalVault::core`, project warnings, sanitizers, and static-analysis settings
-    (`tests/CMakeLists.txt:16-31,71-73`). Local development and sanitizer create/open probe runs
-    returned success with matching UUID/settings; this proves the workflow locally but does not
-    substitute for the outstanding Windows archive open.
+    Windows contention half of the manual gate. **User-reported PASS — cross-platform read-only
+    open:** on a Windows PC, the probe opened the Mac-created archive and printed
+    `open-read-only ok uuid=ac4357f5-bc29-47d4-8eb4-3d65ab60996d format_version=1
+    chunk_size_bytes=4194304 zstd_level=3 hash_algorithm=blake3`. Those values exactly match the Mac
+    create/open evidence recorded above, proving repository identity and all exposed format
+    settings survived the transfer. The probe uses
+    `Repository::open(..., OpenMode::read_only)` and reports the compared fields
+    (`tests/support/repository_probe.cpp:16-45`); its Win32 `wmain` accepts the native Windows path
+    (`tests/support/repository_probe.cpp:49-64`). Both halves of the user-run manual gate are
+    therefore complete.
 
 23. **PASS — Implementation log.** The implementation log exists at
     `docs/implementation-logs/M1/2026-07-12-codex-database-repository-lifecycle.md` and records the
@@ -220,12 +218,11 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
 
 - Evidence deviation: the strict configure is successful but reports the deprecated
   `SQLite::SQLite3` CMake target as a non-fatal author warning.
-- User-reported evidence closes the live Windows lock-contention check. External evidence remains
-  absent only for opening the Mac-created archive read-only on Windows.
+- User-reported Windows PC evidence closes both manual checks: live lock contention and read-only
+  open of the Mac-created repository archive with matching UUID/settings.
 
-**Totals: 24 PASS, 0 FAIL, 1 PENDING (25 rows).**
+**Totals: 25 PASS, 0 FAIL, 0 PENDING (25 rows).**
 
-**M1 gate verdict:** code- and CI-complete: every implementation/test row passes and exact-commit
-CI is green on all three platforms. M1 is not yet milestone-complete only because row 22 remains
-PENDING; the live Windows contention half is user-reported PASS, but the Mac-created repository
-archive must still be opened read-only on Windows before M1 can be declared complete.
+**M1 gate verdict:** complete. Every implementation and test row passes, exact-commit CI is green
+on all three platforms, and user-reported Windows PC evidence closes both manual checks. Milestone
+1 is code-complete and milestone-complete.

@@ -71,3 +71,6 @@ Milestone: Database and repository lifecycle
 - Critical invariant review: seven findings repaired and re-checked; no blocker remains.
 - Manual portability probe: Mac `create` and `open-read-only` returned matching repository UUID and
   format/settings; the resulting repository was archived for the user-run Windows read-only open.
+- Windows manual gate (user-reported, 2026-07-13): the focused live lock-contention command passed,
+  and `open-read-only` opened the Mac-created archive with matching UUID
+  `ac4357f5-bc29-47d4-8eb4-3d65ab60996d`, format version, chunk size, zstd level, and hash algorithm.
