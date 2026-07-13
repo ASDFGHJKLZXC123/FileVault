@@ -3,8 +3,9 @@
 Date: 2026-07-12
 Verifier role: fresh independent verification; no implementation fixes made
 Workspace: `/Users/f8fq/dev/LocalVault`
-Verified tree state: M1 is committed on `main` at
-`81a8cae191c9194d41ec036169cb33484f85aafd`.
+Verified tree state: the M1 baseline is committed on `main` at
+`81a8cae191c9194d41ec036169cb33484f85aafd`; the current tree also adds the test-support-only
+manual portability probe follow-up described below.
 
 ## Local command evidence
 
@@ -28,6 +29,11 @@ Verified tree state: M1 is committed on `main` at
   nine repaired/adjacent repository and database tests via development CTest and then the same
   nine with a direct sanitizer-binary GoogleTest filter; both runs passed 9/9. A fresh full-tree
   clang-format 22.1.8 dry run also passed.
+- Manual-probe follow-up: the warning-strict target was current and the orchestrator reported the
+  unchanged full CTest suite at 37/37. A direct Mac probe `create` and `open-read-only` returned
+  matching UUID `ac4357f5-bc29-47d4-8eb4-3d65ab60996d`; the verifier independently repeated the
+  flow with matching UUID `c423c124-f023-4d92-a660-feb7b85a858b`. Direct ASan/UBSan probe create
+  and open-read-only also passed with matching UUID `8cdb9be3-6604-4926-81f4-6affa84a0819`.
 
 ## Completion checklist
 
@@ -171,15 +177,30 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
     build, and test steps were green on Windows (2m04s), Linux (1m33s), and macOS (1m18s). The run
     page independently shows status `Success`, pushed commit `81a8cae`, and all three job durations.
 
-22. **PENDING — Windows VM manual verification.** No independent evidence was provided or produced
-    for observing contention in a current Windows VM or opening a Mac-created repository read-only
-    there. This is a Richard/user manual gate and is not self-certified.
+22. **PENDING — Windows VM manual verification (one of two checks complete).** **User-reported
+    PASS — live lock contention:** the user reports running every supplied Windows command,
+    including configure, build, full CTest, and the focused verbose
+    `RepositoryLockIntegrationTest.SecondProcessReceivesRepositoryBusy`; this satisfies the live
+    Windows contention half of the manual gate. **PENDING — cross-platform read-only open:** the
+    Mac-created repository archive has not yet been opened read-only on Windows, so the checklist
+    row remains PENDING. The new `localvault_repository_probe` genuinely enables that check: its
+    `create` command persists a repository and immediately validates it read-only, while
+    `open-read-only` calls `Repository::open(..., OpenMode::read_only)` and prints UUID, format
+    version, chunk size, zstd level, and hash algorithm for comparison
+    (`tests/support/repository_probe.cpp:16-45`). Its Win32 `wmain` accepts the same commands and a
+    native Windows path (`tests/support/repository_probe.cpp:49-64`), and CMake builds/links the
+    helper with `LocalVault::core`, project warnings, sanitizers, and static-analysis settings
+    (`tests/CMakeLists.txt:16-31,71-73`). Local development and sanitizer create/open probe runs
+    returned success with matching UUID/settings; this proves the workflow locally but does not
+    substitute for the outstanding Windows archive open.
 
 23. **PASS — Implementation log.** The implementation log exists at
     `docs/implementation-logs/M1/2026-07-12-codex-database-repository-lifecycle.md` and records the
     operation-history decision, immutable/sidecar and cleanup decisions, FR-005 amendment, Windows
-    flush deviation, sanitizer gotcha, FR map, and later-milestone gotchas. Its positive read-only
-    proof claim now matches the repaired platform implementation described in rows 2 and 20.
+    flush deviation, sanitizer gotcha, FR map, later-milestone gotchas, and the scoped decision to
+    keep the manual portability helper under `tests/support` rather than adding M7 repository
+    commands to the product CLI. Its positive read-only proof claim matches the repaired platform
+    implementation described in rows 2 and 20.
 
 24. **PASS — Full verification checklist state.** This verification log contains all 25 requested
     rows with one explicit state and concrete source/test/command evidence for each, followed by
@@ -199,10 +220,12 @@ authoritative: FR-005 recovery is deferred to M4 and is not expected in M1.
 
 - Evidence deviation: the strict configure is successful but reports the deprecated
   `SQLite::SQLite3` CMake target as a non-fatal author warning.
-- External evidence remains absent only for the two Windows VM manual checks.
+- User-reported evidence closes the live Windows lock-contention check. External evidence remains
+  absent only for opening the Mac-created archive read-only on Windows.
 
 **Totals: 24 PASS, 0 FAIL, 1 PENDING (25 rows).**
 
 **M1 gate verdict:** code- and CI-complete: every implementation/test row passes and exact-commit
 CI is green on all three platforms. M1 is not yet milestone-complete only because row 22 remains
-PENDING; the user/Richard Windows VM checks must be recorded before M1 can be declared complete.
+PENDING; the live Windows contention half is user-reported PASS, but the Mac-created repository
+archive must still be opened read-only on Windows before M1 can be declared complete.

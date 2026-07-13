@@ -20,6 +20,8 @@ Milestone: Database and repository lifecycle
 - Migration execution owns its exclusive transaction. The initial `repository_info` insert uses a
   following exclusive transaction; caught initialization failures remove the invalid repository.
   Crash recovery remains M4 work.
+- Keep the manual portability probe under `tests/support`: it exposes only `create` and
+  `open-read-only` for the M1 Windows gate. Repository commands in the product CLI remain M7 work.
 
 ## Plan amendment and deviations
 
@@ -58,6 +60,8 @@ Milestone: Database and repository lifecycle
   repositories never delete `repository.lock`.
 - Cross-platform URI-encoding tests must use filenames legal on Windows: `?` is not allowed in a
   Win32 filename, so Windows coverage uses legal URI-significant `#` and `%` characters instead.
+- A manual cross-platform gate needs a persistent repository rather than the test suite's temporary
+  directories. Use `localvault_repository_probe`; do not add milestone-future commands to the CLI.
 
 ## Local evidence
 
@@ -65,3 +69,5 @@ Milestone: Database and repository lifecycle
 - Development CTest: 37/37 passed.
 - ASan/UBSan test binary (`detect_leaks=0` on macOS): 37/37 passed.
 - Critical invariant review: seven findings repaired and re-checked; no blocker remains.
+- Manual portability probe: Mac `create` and `open-read-only` returned matching repository UUID and
+  format/settings; the resulting repository was archived for the user-run Windows read-only open.

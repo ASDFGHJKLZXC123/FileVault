@@ -13,8 +13,19 @@ add_executable(
     support/lock_contention_helper.cpp
 )
 
+add_executable(
+    localvault_repository_probe
+    support/repository_probe.cpp
+)
+
 target_link_libraries(
     localvault_lock_contention_helper
+    PRIVATE
+        LocalVault::core
+)
+
+target_link_libraries(
+    localvault_repository_probe
     PRIVATE
         LocalVault::core
 )
@@ -56,3 +67,7 @@ localvault_enable_clang_tidy(localvault_tests)
 localvault_set_warnings(localvault_lock_contention_helper)
 localvault_enable_sanitizers(localvault_lock_contention_helper)
 localvault_enable_clang_tidy(localvault_lock_contention_helper)
+
+localvault_set_warnings(localvault_repository_probe)
+localvault_enable_sanitizers(localvault_repository_probe)
+localvault_enable_clang_tidy(localvault_repository_probe)
