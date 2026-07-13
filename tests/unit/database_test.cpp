@@ -25,7 +25,11 @@ class TemporaryDatabase final {
                 ("localvault_database_test_" + std::to_string(timestamp) + "_" +
                  std::to_string(sequence.fetch_add(1)));
         std::filesystem::create_directory(root_);
-        path_ = root_ / "repository #?.db";
+#ifdef _WIN32
+        path_ = root_ / "repository #%25.db";
+#else
+        path_ = root_ / "repository #?%25.db";
+#endif
     }
 
     ~TemporaryDatabase() {

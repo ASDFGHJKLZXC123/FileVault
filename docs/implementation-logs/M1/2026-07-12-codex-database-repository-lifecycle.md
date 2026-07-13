@@ -56,6 +56,8 @@ Milestone: Database and repository lifecycle
 - Add schema changes only as new ordered migrations; never edit migration 001 after release.
 - The lock file contents are diagnostics only. OS lock ownership is authoritative, and successful
   repositories never delete `repository.lock`.
+- Cross-platform URI-encoding tests must use filenames legal on Windows: `?` is not allowed in a
+  Win32 filename, so Windows coverage uses legal URI-significant `#` and `%` characters instead.
 
 ## Local evidence
 
