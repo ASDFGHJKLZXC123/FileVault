@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -293,7 +294,14 @@ TEST(FileScannerTest, NativeWindowsJunctionIsCapturedAndNeverTraversed) {
     std::filesystem::path source;
     std::string junction_name;
     std::string nested_name;
-    const char* configured_source = std::getenv("LOCALVAULT_M5_JUNCTION_LOOP_SOURCE");
+    char* configured_source = nullptr;
+    std::size_t configured_source_size = 0;
+    ASSERT_EQ(_dupenv_s(&configured_source, &configured_source_size,
+                        "LOCALVAULT_M5_JUNCTION_LOOP_SOURCE"),
+              0);
+    const std::unique_ptr<char, decltype(&std::free)> configured_source_owner(configured_source,
+                                                                              &std::free);
+    static_cast<void>(configured_source_owner);
     if (configured_source != nullptr && configured_source[0] != '\0') {
         source = configured_source;
         junction_name = "loop";
