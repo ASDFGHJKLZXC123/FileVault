@@ -29,6 +29,9 @@ void Chunker::for_each_chunk(const std::filesystem::path& source, std::stop_toke
     if (!callback) {
         throw LocalVaultError(ErrorCode::invalid_argument, "chunk callback must not be empty");
     }
+    if (stop_token.stop_requested()) {
+        throw LocalVaultError(ErrorCode::cancelled, "snapshot cancelled", source);
+    }
     std::ifstream input(source, std::ios::binary);
     if (!input) {
         throw LocalVaultError(ErrorCode::filesystem_error, "failed to open source file", source);

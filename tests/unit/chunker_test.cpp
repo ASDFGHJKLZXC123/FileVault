@@ -182,5 +182,24 @@ TEST(ChunkerTest, CancellationIsCheckedBeforeReadingAndBetweenChunks) {
     EXPECT_EQ(buffer.read_calls(), 1U);
 }
 
+TEST(ChunkerTest, PathOverloadChecksCancellationBeforeOpeningSource) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path missing = temporary.path() / "missing.bin";
+    std::stop_source stop;
+    stop.request_stop();
+    bool callback_called = false;
+
+    try {
+        Chunker(4).for_each_chunk(
+            missing, stop.get_token(),
+            [&](ByteCount, std::span<const std::byte>) { callback_called = true; });
+        FAIL() << "path chunking unexpectedly ignored pre-requested cancellation";
+    } catch (const LocalVaultError& error) {
+        EXPECT_EQ(error.code(), ErrorCode::cancelled);
+        EXPECT_EQ(error.path(), missing);
+    }
+    EXPECT_FALSE(callback_called);
+}
+
 } // namespace
 } // namespace localvault

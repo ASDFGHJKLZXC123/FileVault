@@ -57,6 +57,96 @@ jobs:
       - name: Test
         run: ctest --preset development
 
+  linux-sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg-archives
+          key: vcpkg-archives-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-archives-linux-${{ env.VCPKG_COMMIT }}-
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive autopoint automake \
+            libtool libtool-bin libltdl-dev build-essential gfortran libnuma1 libnuma-dev \
+            libudev-dev bison libbison-dev flex gperf nasm yasm swig ruby-full python3 \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrender-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev mesa-common-dev libgl1-mesa-dev \
+            libglu1-mesa-dev libgles2-mesa-dev libxrandr-dev libxcursor-dev libxdamage-dev \
+            libxinerama-dev libxaw7-dev libxt-dev libxxf86vm-dev xutils-dev '^libxcb.*-dev'
+
+      - name: Bootstrap pinned vcpkg
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/.tmp/vcpkg
+        run: |
+          rm -rf "${VCPKG_ROOT}"
+          mkdir -p "${VCPKG_ROOT}"
+          git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+          git -C "${VCPKG_ROOT}" checkout "$VCPKG_COMMIT"
+          "${VCPKG_ROOT}/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
+          echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
+
+      - name: Configure ASan and UBSan
+        run: cmake --preset sanitizers -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build ASan and UBSan
+        run: cmake --build --preset sanitizers --parallel
+
+      - name: Test ASan and UBSan
+        run: ctest --preset sanitizers
+
+  linux-tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg-archives
+          key: vcpkg-archives-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-archives-linux-${{ env.VCPKG_COMMIT }}-
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive autopoint automake \
+            libtool libtool-bin libltdl-dev build-essential gfortran libnuma1 libnuma-dev \
+            libudev-dev bison libbison-dev flex gperf nasm yasm swig ruby-full python3 \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrender-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev mesa-common-dev libgl1-mesa-dev \
+            libglu1-mesa-dev libgles2-mesa-dev libxrandr-dev libxcursor-dev libxdamage-dev \
+            libxinerama-dev libxaw7-dev libxt-dev libxxf86vm-dev xutils-dev '^libxcb.*-dev'
+
+      - name: Bootstrap pinned vcpkg
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/.tmp/vcpkg
+        run: |
+          rm -rf "${VCPKG_ROOT}"
+          mkdir -p "${VCPKG_ROOT}"
+          git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+          git -C "${VCPKG_ROOT}" checkout "$VCPKG_COMMIT"
+          "${VCPKG_ROOT}/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
+          echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
+
+      - name: Configure TSan
+        run: cmake --preset thread-sanitizer -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build TSan
+        run: cmake --build --preset thread-sanitizer --parallel
+
+      - name: Test concurrency filter under TSan
+        run: ctest --preset thread-sanitizer
+
   macos:
     runs-on: macos-15
     steps:

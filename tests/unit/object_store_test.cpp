@@ -26,6 +26,18 @@
 #include "support/test_filesystem.hpp"
 
 namespace localvault {
+
+class ObjectStoreTestAccess final {
+  public:
+    [[nodiscard]] static std::size_t known_object_count(const ObjectStore& store) {
+        return store.known_objects_.size();
+    }
+
+    [[nodiscard]] static std::size_t maximum_known_objects() {
+        return ObjectStore::maximum_known_objects;
+    }
+};
+
 namespace {
 
 constexpr ByteCount test_chunk_limit = 512ULL * 1024ULL;
@@ -151,6 +163,48 @@ TEST_F(ObjectStoreFixture, MapsStrictHashStoresOneZstdFrameAndReusesMetadata) {
     ObjectStore unavailable_cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3,
                                        noop_failure_injector());
     expect_error_code([&] { (void)unavailable_cold_cache.store(abc); }, ErrorCode::database_error);
+}
+
+TEST_F(ObjectStoreFixture, KnownObjectCacheClearsAtFixedLimitAndReuseRemainsCorrect) {
+    const std::size_t limit = ObjectStoreTestAccess::maximum_known_objects();
+    ASSERT_GT(limit, 0U);
+    std::vector<std::array<std::byte, 2>> contents;
+    contents.reserve(limit + 1U);
+    std::optional<StoredObject> first;
+    for (std::size_t index = 0; index <= limit; ++index) {
+        const std::array bytes{
+            std::byte{static_cast<unsigned char>(index & 0xFFU)},
+            std::byte{static_cast<unsigned char>((index >> 8U) & 0xFFU)},
+        };
+        contents.push_back(bytes);
+        const StoredObject stored = objects_.store(contents.back());
+        EXPECT_TRUE(stored.newly_stored);
+        if (index == 0U) {
+            first = stored;
+        }
+        EXPECT_LE(ObjectStoreTestAccess::known_object_count(objects_), limit);
+    }
+
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(ObjectStoreTestAccess::known_object_count(objects_), 1U);
+    const StoredObject reused = objects_.store(contents.front());
+    EXPECT_FALSE(reused.newly_stored);
+    EXPECT_EQ(objects_.read_verified(reused.hash_hex, reused.relative_path, reused.raw_size,
+                                     reused.stored_size),
+              (std::vector<std::byte>(contents.front().begin(), contents.front().end())));
+    EXPECT_LE(ObjectStoreTestAccess::known_object_count(objects_), limit);
+
+    auto chunk_count = database_.statement("SELECT COUNT(*) FROM chunks");
+    ASSERT_TRUE(chunk_count.step());
+    EXPECT_EQ(chunk_count.column_int64(0), static_cast<std::int64_t>(limit + 1U));
+
+    ObjectStore filesystem_only(temporary_.path(), test_chunk_limit, 3, noop_failure_injector());
+    for (const auto& bytes : contents) {
+        EXPECT_FALSE(filesystem_only.store(bytes).newly_stored);
+        EXPECT_LE(ObjectStoreTestAccess::known_object_count(filesystem_only), limit);
+    }
+    EXPECT_EQ(ObjectStoreTestAccess::known_object_count(filesystem_only), 1U);
+    EXPECT_FALSE(filesystem_only.store(contents.front()).newly_stored);
 }
 
 TEST_F(ObjectStoreFixture, ReadRejectsInvalidMissingWrongSizedCorruptAndMultipleFrames) {

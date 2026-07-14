@@ -7,7 +7,10 @@
 #include <string_view>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#else
 #include <sys/stat.h>
 #endif
 
@@ -42,6 +45,73 @@ namespace {
         result.push_back(static_cast<char>(character));
     }
     return result;
+}
+
+void write_text(const std::filesystem::path& path, std::string_view contents) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output) << path;
+    output << contents;
+    ASSERT_TRUE(output) << path;
+}
+
+#ifdef _WIN32
+[[nodiscard]] bool create_junction(const std::filesystem::path& junction,
+                                   const std::filesystem::path& target) {
+    std::wstring command =
+        L"cmd.exe /D /C mklink /J \"" + junction.native() + L"\" \"" + target.native() + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = static_cast<DWORD>(sizeof(startup));
+    PROCESS_INFORMATION process{};
+    if (::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                         nullptr, nullptr, &startup, &process) == 0) {
+        return false;
+    }
+    const DWORD wait_result = ::WaitForSingleObject(process.hProcess, 30'000);
+    DWORD exit_code = 1;
+    const bool completed =
+        wait_result == WAIT_OBJECT_0 && ::GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+    (void)::CloseHandle(process.hThread);
+    (void)::CloseHandle(process.hProcess);
+    return completed && exit_code == 0;
+}
+#endif
+
+TEST(FileScannerDecisionTest, FakedPlatformAttributesChooseSafeActions) {
+    const FileScannerOptions options;
+    EXPECT_EQ(decide_scan_entry({.kind = ScanEntryKind::ordinary}, options).action,
+              ScanEntryAction::capture);
+    EXPECT_EQ(decide_scan_entry({.kind = ScanEntryKind::symbolic_link}, options).action,
+              ScanEntryAction::capture_as_symbolic_link);
+    EXPECT_EQ(decide_scan_entry({.kind = ScanEntryKind::junction}, options).action,
+              ScanEntryAction::capture_as_symbolic_link);
+
+    const ScanEntryDecision mount =
+        decide_scan_entry({.kind = ScanEntryKind::volume_mount_point}, options);
+    EXPECT_EQ(mount.action, ScanEntryAction::warn_and_skip);
+    EXPECT_EQ(mount.warning_code, "volume_mount_point");
+
+    const ScanEntryDecision cloud = decide_scan_entry({.cloud_placeholder = true}, options);
+    EXPECT_EQ(cloud.action, ScanEntryAction::warn_and_skip);
+    EXPECT_EQ(cloud.warning_code, "cloud_placeholder");
+}
+
+TEST(FileScannerDecisionTest, HiddenAndFilesystemBoundaryOptionsAreAppliedToFakeFacts) {
+    EXPECT_EQ(decide_scan_entry({.hidden = true}, FileScannerOptions{}).action,
+              ScanEntryAction::capture);
+    EXPECT_EQ(
+        decide_scan_entry({.hidden = true}, FileScannerOptions{.include_hidden = false}).action,
+        ScanEntryAction::skip);
+
+    const ScanEntryFacts posix_device_boundary{.filesystem_boundary = true};
+    const ScanEntryFacts windows_volume_boundary{.filesystem_boundary = true};
+    EXPECT_EQ(decide_scan_entry(posix_device_boundary, FileScannerOptions{}).action,
+              ScanEntryAction::capture);
+    for (const ScanEntryFacts facts : {posix_device_boundary, windows_volume_boundary}) {
+        const ScanEntryDecision decision =
+            decide_scan_entry(facts, FileScannerOptions{.one_file_system = true});
+        EXPECT_EQ(decision.action, ScanEntryAction::warn_and_skip);
+        EXPECT_EQ(decision.warning_code, "filesystem_boundary");
+    }
 }
 
 TEST(FileScannerTest, EmitsRootFilesDirectoriesHiddenAndExactUnicodePaths) {
@@ -105,6 +175,18 @@ TEST(FileScannerTest, EmitsRootFilesDirectoriesHiddenAndExactUnicodePaths) {
     EXPECT_EQ(first_paths, second_paths);
 }
 
+TEST(FileScannerTest, CollectingScanReturnsCanonicalRepositoryRelativePathOrder) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    test::DatasetBuilder(source)
+        .text_file("zeta.txt", "created first")
+        .text_file("middle.txt", "created second")
+        .text_file("alpha/deep.txt", "created last");
+
+    EXPECT_EQ(scanned_paths(FileScanner{}.scan(source)),
+              (std::vector<std::string>{"", "alpha", "alpha/deep.txt", "middle.txt", "zeta.txt"}));
+}
+
 TEST(FileScannerTest, CapturesBrokenAndDirectorySymlinksWithoutFollowingThem) {
     test::TemporaryDirectory temporary;
     const std::filesystem::path source = temporary.path() / "source";
@@ -136,6 +218,96 @@ TEST(FileScannerTest, CapturesBrokenAndDirectorySymlinksWithoutFollowingThem) {
     EXPECT_EQ(find_entry(result, "linked-directory/inside.txt"), nullptr);
     EXPECT_NE(find_entry(result, "real/inside.txt"), nullptr);
 }
+
+TEST(FileScannerTest, HiddenEntriesAreIncludedByDefaultAndPrunedWhenDisabled) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    test::DatasetBuilder(source)
+        .text_file("visible.txt", "visible")
+        .text_file(".hidden-file", "hidden")
+        .text_file(".hidden-directory/inside.txt", "hidden nested");
+#ifdef _WIN32
+    for (const std::filesystem::path& hidden_path :
+         {source / ".hidden-file", source / ".hidden-directory"}) {
+        const DWORD attributes = ::GetFileAttributesW(hidden_path.c_str());
+        ASSERT_NE(attributes, INVALID_FILE_ATTRIBUTES);
+        ASSERT_NE(::SetFileAttributesW(hidden_path.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN), 0);
+    }
+#endif
+
+    const ScanResult included = FileScanner{}.scan(source);
+    EXPECT_NE(find_entry(included, ".hidden-file"), nullptr);
+    EXPECT_NE(find_entry(included, ".hidden-directory/inside.txt"), nullptr);
+
+    const ScanResult pruned =
+        FileScanner{}.scan(source, FileScannerOptions{.include_hidden = false});
+    EXPECT_NE(find_entry(pruned, "visible.txt"), nullptr);
+    EXPECT_EQ(find_entry(pruned, ".hidden-file"), nullptr);
+    EXPECT_EQ(find_entry(pruned, ".hidden-directory"), nullptr);
+    EXPECT_EQ(find_entry(pruned, ".hidden-directory/inside.txt"), nullptr);
+    EXPECT_TRUE(pruned.warnings.empty());
+}
+
+TEST(FileScannerTest, IgnoreRulesPruneDirectoriesBeforeEnumeratingTheirChildren) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    test::DatasetBuilder(source)
+        .text_file("kept.txt", "kept")
+        .text_file("ignored.txt", "ignored")
+        .text_file("nested/drop.tmp", "ignored wildcard")
+        .text_file("ignored-directory/child-that-would-not-match.txt", "must not enumerate");
+    write_text(source / ".localvaultignore", "ignored.txt\nnested/*.tmp\nignored-directory/\n");
+
+    const ScanResult result = FileScanner{}.scan(source);
+
+    EXPECT_NE(find_entry(result, "kept.txt"), nullptr);
+    EXPECT_NE(find_entry(result, ".localvaultignore"), nullptr);
+    EXPECT_EQ(find_entry(result, "ignored.txt"), nullptr);
+    EXPECT_EQ(find_entry(result, "nested/drop.tmp"), nullptr);
+    EXPECT_EQ(find_entry(result, "ignored-directory"), nullptr);
+    EXPECT_EQ(find_entry(result, "ignored-directory/child-that-would-not-match.txt"), nullptr);
+    EXPECT_TRUE(result.warnings.empty());
+}
+
+TEST(FileScannerTest, ExplicitIgnoreFileReplacesRootRules) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path replacement = temporary.path() / "replacement.ignore";
+    test::DatasetBuilder(source)
+        .text_file("root-only.txt", "kept by replacement")
+        .text_file("replacement-only.txt", "ignored by replacement");
+    write_text(source / ".localvaultignore", "root-only.txt\n");
+    write_text(replacement, "replacement-only.txt\n");
+
+    const ScanResult result =
+        FileScanner{}.scan(source, FileScannerOptions{.ignore_file = replacement});
+
+    EXPECT_NE(find_entry(result, "root-only.txt"), nullptr);
+    EXPECT_EQ(find_entry(result, "replacement-only.txt"), nullptr);
+}
+
+#ifdef _WIN32
+TEST(FileScannerTest, NativeWindowsJunctionIsCapturedAndNeverTraversed) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path target = temporary.path() / "target";
+    test::DatasetBuilder(source).text_file("ordinary.txt", "ordinary");
+    test::DatasetBuilder(target).text_file("inside.txt", "must not traverse");
+    const std::filesystem::path junction = source / "junction";
+    if (!create_junction(junction, target)) {
+        GTEST_SKIP() << "mklink /J is unavailable in this Windows environment";
+    }
+
+    const ScanResult result = FileScanner{}.scan(source);
+
+    const ScannedEntry* entry = find_entry(result, "junction");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->type, EntryType::symbolic_link);
+    EXPECT_TRUE(entry->symlink_target.has_value());
+    EXPECT_FALSE(entry->symlink_target->empty());
+    EXPECT_EQ(find_entry(result, "junction/inside.txt"), nullptr);
+}
+#endif
 
 #ifndef _WIN32
 TEST(FileScannerTest, WarnsAndSkipsSpecialEntriesAndInvalidUtf8WhereSupported) {

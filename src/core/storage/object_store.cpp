@@ -136,20 +136,26 @@ void ensure_directory(const std::filesystem::path& path) {
 
 ObjectStore::ObjectStore(std::filesystem::path repository_root, MetadataStore& metadata,
                          ByteCount maximum_chunk_size, int compression_level,
-                         std::shared_ptr<FailureInjector> failure_injector)
+                         std::shared_ptr<FailureInjector> failure_injector,
+                         std::shared_ptr<ObjectStoreSynchronization> synchronization)
     : ObjectStore(std::move(repository_root), maximum_chunk_size, compression_level,
-                  std::move(failure_injector)) {
+                  std::move(failure_injector), std::move(synchronization)) {
     metadata_ = &metadata;
 }
 
 ObjectStore::ObjectStore(std::filesystem::path repository_root, ByteCount maximum_chunk_size,
-                         int compression_level, std::shared_ptr<FailureInjector> failure_injector)
+                         int compression_level, std::shared_ptr<FailureInjector> failure_injector,
+                         std::shared_ptr<ObjectStoreSynchronization> synchronization)
     : repository_root_(std::move(repository_root)), failure_injector_(std::move(failure_injector)),
+      synchronization_(std::move(synchronization)),
       maximum_chunk_size_(checked_maximum_chunk_size(maximum_chunk_size)),
       codec_(compression_level) {
     if (!failure_injector_) {
         throw LocalVaultError(ErrorCode::invalid_argument,
                               "object storage requires a failure injector");
+    }
+    if (!synchronization_) {
+        synchronization_ = std::make_shared<ObjectStoreSynchronization>();
     }
 }
 
@@ -194,20 +200,33 @@ StoredObject ObjectStore::require_reusable(const StoredObject& known,
 std::optional<StoredObject> ObjectStore::find_existing(std::string_view hash_hex,
                                                        const std::filesystem::path& relative_path,
                                                        ByteCount raw_size) {
-    // M3 storage is single-threaded, with no concurrent metadata mutation or GC. Cache hits can
-    // therefore skip SQLite, but immutable final-file existence and size are always rechecked.
+    // Each snapshot worker owns its ObjectStore instance. Cache hits can therefore skip SQLite,
+    // but immutable final-file existence and size are always rechecked.
     const auto cached = known_objects_.find(std::string(hash_hex));
     if (cached != known_objects_.end()) {
         return require_reusable(cached->second, hash_hex, relative_path, raw_size);
     }
 
-    const std::optional<StoredChunkInfo> metadata = metadata_->find_chunk(hash_hex);
-    if (metadata.has_value()) {
-        StoredObject known{metadata->hash_hex, metadata->object_path, metadata->raw_size,
-                           metadata->stored_size, false};
-        StoredObject reused = require_reusable(known, hash_hex, relative_path, raw_size);
-        known_objects_.insert_or_assign(reused.hash_hex, reused);
-        return reused;
+    if (metadata_ != nullptr) {
+        const std::optional<StoredChunkInfo> metadata = metadata_->find_chunk(hash_hex);
+        if (metadata.has_value()) {
+            StoredObject known{metadata->hash_hex, metadata->object_path, metadata->raw_size,
+                               metadata->stored_size, false};
+            StoredObject reused = require_reusable(known, hash_hex, relative_path, raw_size);
+            remember(reused);
+            return reused;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<StoredObject>
+ObjectStore::find_existing_file(std::string_view hash_hex,
+                                const std::filesystem::path& relative_path, ByteCount raw_size) {
+    const auto cached = known_objects_.find(std::string(hash_hex));
+    if (cached != known_objects_.end()) {
+        return require_reusable(cached->second, hash_hex, relative_path, raw_size);
     }
 
     const std::filesystem::path final_path = repository_root_ / relative_path;
@@ -218,23 +237,14 @@ std::optional<StoredObject> ObjectStore::find_existing(std::string_view hash_hex
     (void)read_verified(hash_hex, relative_path, raw_size, *orphan_size);
     sync_existing_regular_file(final_path);
     flush_containing_directory(final_path);
-    metadata_->ensure_chunk({
-        .hash_hex = std::string(hash_hex),
-        .raw_size = raw_size,
-        .stored_size = *orphan_size,
-        .object_path = relative_path,
-        .created_at_ns = now_nanoseconds(),
-    });
     StoredObject adopted{std::string(hash_hex), relative_path, raw_size, *orphan_size, false};
-    known_objects_.insert_or_assign(adopted.hash_hex, adopted);
+    if (metadata_ == nullptr) {
+        remember(adopted);
+    }
     return adopted;
 }
 
-StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
-    if (metadata_ == nullptr) {
-        throw LocalVaultError(ErrorCode::invalid_argument,
-                              "object storage requires writable metadata");
-    }
+StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes, std::stop_token stop_token) {
     if (raw_bytes.empty()) {
         throw LocalVaultError(ErrorCode::invalid_argument,
                               "empty files must not create stored objects");
@@ -251,6 +261,13 @@ StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
         return std::move(*existing);
     }
 
+    const auto stripe_index =
+        static_cast<std::size_t>(std::stoul(hash_hex.substr(0, 2), nullptr, 16));
+
+    if (stop_token.stop_requested()) {
+        throw LocalVaultError(ErrorCode::cancelled, "object storage cancelled",
+                              repository_root_ / relative_path);
+    }
     const std::vector<std::byte> compressed = codec_.compress(raw_bytes);
     const ByteCount stored_size = checked_byte_count(compressed.size());
     if (stored_size == 0 ||
@@ -259,44 +276,86 @@ StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
                               "compressed object exceeds the configured safety limit");
     }
 
-    const std::filesystem::path final_path = repository_root_ / relative_path;
-    ensure_directory(final_path.parent_path());
-    // Repeat this durability barrier even when the shard already exists. If a prior attempt
-    // created the shard but failed while syncing objects/, its retry must not skip that sync.
-    flush_containing_directory(final_path.parent_path());
-    const std::filesystem::path temporary_directory = repository_root_ / "temporary" / "objects";
-    ensure_directory(temporary_directory);
-
-    TemporaryOutputFile temporary(temporary_directory);
-    temporary.write(compressed);
-    failure_injector_->hit(FailurePoint::after_temp_object_write);
-    temporary.sync();
-    failure_injector_->hit(FailurePoint::after_object_fsync);
-    if (std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size)) {
-        return std::move(*existing);
+    StoredObject stored;
+    if (synchronization_->stripe_test_hook) {
+        synchronization_->stripe_test_hook(false);
     }
-    const RestorePublishResult publication = temporary.publish(final_path, false);
-    if (publication == RestorePublishResult::destination_exists) {
-        std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size);
-        if (!existing.has_value()) {
-            throw LocalVaultError(ErrorCode::filesystem_error,
-                                  "duplicate object disappeared during publication", final_path);
+    {
+        std::lock_guard stripe_lock(synchronization_->object_mutexes[stripe_index]);
+        if (synchronization_->stripe_test_hook) {
+            synchronization_->stripe_test_hook(true);
         }
-        return std::move(*existing);
+        if (std::optional<StoredObject> rechecked =
+                find_existing_file(hash_hex, relative_path, raw_size)) {
+            stored = std::move(*rechecked);
+        } else {
+            const std::filesystem::path final_path = repository_root_ / relative_path;
+            ensure_directory(final_path.parent_path());
+            // Repeat this durability barrier even when the shard already exists. If a prior
+            // attempt created the shard but failed while syncing objects/, its retry must not skip
+            // that sync.
+            flush_containing_directory(final_path.parent_path());
+            const std::filesystem::path temporary_directory =
+                repository_root_ / "temporary" / "objects";
+            ensure_directory(temporary_directory);
+
+            TemporaryOutputFile temporary(temporary_directory);
+            temporary.write(compressed);
+            failure_injector_->hit(FailurePoint::after_temp_object_write);
+            temporary.sync();
+            failure_injector_->hit(FailurePoint::after_object_fsync);
+            const RestorePublishResult publication = temporary.publish(final_path, false);
+            if (publication == RestorePublishResult::destination_exists) {
+                std::optional<StoredObject> published_existing =
+                    find_existing_file(hash_hex, relative_path, raw_size);
+                if (!published_existing.has_value()) {
+                    throw LocalVaultError(ErrorCode::filesystem_error,
+                                          "duplicate object disappeared during publication",
+                                          final_path);
+                }
+                stored = std::move(*published_existing);
+            } else {
+                failure_injector_->hit(FailurePoint::after_object_rename);
+                flush_containing_directory(final_path);
+                stored = {hash_hex, relative_path, raw_size, stored_size, true};
+                if (metadata_ == nullptr) {
+                    remember(StoredObject{hash_hex, relative_path, raw_size, stored_size, false});
+                }
+            }
+        }
     }
 
-    failure_injector_->hit(FailurePoint::after_object_rename);
-    flush_containing_directory(final_path);
+    if (metadata_ != nullptr) {
+        ensure_metadata(stored);
+    }
+    return stored;
+}
+
+void ObjectStore::ensure_metadata(const StoredObject& object) {
+    if (metadata_ == nullptr) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "registering an object requires writable metadata");
+    }
+    require_valid_hash(object.hash_hex, ErrorCode::object_corrupt);
+    const std::filesystem::path relative_path = derived_path(object.hash_hex);
+    const StoredObject verified =
+        require_reusable(object, object.hash_hex, relative_path, object.raw_size);
     metadata_->ensure_chunk({
-        .hash_hex = hash_hex,
-        .raw_size = raw_size,
-        .stored_size = stored_size,
-        .object_path = relative_path,
+        .hash_hex = verified.hash_hex,
+        .raw_size = verified.raw_size,
+        .stored_size = verified.stored_size,
+        .object_path = verified.relative_path,
         .created_at_ns = now_nanoseconds(),
     });
-    known_objects_.insert_or_assign(
-        hash_hex, StoredObject{hash_hex, relative_path, raw_size, stored_size, false});
-    return {hash_hex, relative_path, raw_size, stored_size, true};
+    remember(verified);
+}
+
+void ObjectStore::remember(const StoredObject& object) {
+    if (known_objects_.size() >= maximum_known_objects &&
+        !known_objects_.contains(object.hash_hex)) {
+        known_objects_.clear();
+    }
+    known_objects_.insert_or_assign(object.hash_hex, object);
 }
 
 std::vector<std::byte> ObjectStore::read_verified(std::string_view hash_hex,

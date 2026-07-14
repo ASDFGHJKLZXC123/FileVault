@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -14,6 +15,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <winioctl.h>
 
 #include "localvault/error.hpp"
 #include "repository_support.hpp"
@@ -41,6 +43,64 @@ class FileHandle final {
   private:
     HANDLE handle_;
 };
+
+[[nodiscard]] ScannerReparseKind read_scanner_reparse_kind(HANDLE handle,
+                                                           const std::filesystem::path& path) {
+    std::array<std::byte, MAXIMUM_REPARSE_DATA_BUFFER_SIZE> buffer{};
+    DWORD returned = 0;
+    if (::DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, nullptr, 0, buffer.data(),
+                          static_cast<DWORD>(buffer.size()), &returned, nullptr) == 0) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect mount-point target (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+    std::uint32_t tag = 0;
+    if (returned < sizeof(tag)) {
+        throw LocalVaultError(ErrorCode::filesystem_error, "reparse data is truncated", path);
+    }
+    std::memcpy(&tag, buffer.data(), sizeof(tag));
+    if (tag == IO_REPARSE_TAG_SYMLINK) {
+        return ScannerReparseKind::symbolic_link;
+    }
+    if (tag != IO_REPARSE_TAG_MOUNT_POINT) {
+        return ScannerReparseKind::other;
+    }
+
+    constexpr std::size_t path_buffer_offset = 16;
+    if (returned < path_buffer_offset) {
+        throw LocalVaultError(ErrorCode::filesystem_error, "mount-point reparse data is truncated",
+                              path);
+    }
+    std::uint16_t substitute_offset = 0;
+    std::uint16_t substitute_length = 0;
+    std::memcpy(&substitute_offset, buffer.data() + 8, sizeof(substitute_offset));
+    std::memcpy(&substitute_length, buffer.data() + 10, sizeof(substitute_length));
+    const std::size_t target_offset = path_buffer_offset + substitute_offset;
+    if ((substitute_offset % sizeof(wchar_t)) != 0U ||
+        (substitute_length % sizeof(wchar_t)) != 0U || target_offset > returned ||
+        substitute_length > returned - target_offset) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "mount-point reparse target is malformed", path);
+    }
+    std::wstring target(substitute_length / sizeof(wchar_t), L'\0');
+    std::memcpy(target.data(), buffer.data() + target_offset, substitute_length);
+    constexpr std::wstring_view volume_prefix = L"\\??\\Volume{";
+    if (target.size() < volume_prefix.size()) {
+        return ScannerReparseKind::junction;
+    }
+    const bool targets_volume = std::ranges::equal(
+        target.substr(0, volume_prefix.size()), volume_prefix, [](wchar_t left, wchar_t right) {
+            if (left >= L'A' && left <= L'Z') {
+                left = static_cast<wchar_t>(left + (L'a' - L'A'));
+            }
+            if (right >= L'A' && right <= L'Z') {
+                right = static_cast<wchar_t>(right + (L'a' - L'A'));
+            }
+            return left == right;
+        });
+    return targets_volume ? ScannerReparseKind::volume_mount_point : ScannerReparseKind::junction;
+}
 
 [[nodiscard]] std::int64_t unix_time_nanoseconds(const FILETIME& time,
                                                  const std::filesystem::path& path) {
@@ -218,7 +278,72 @@ PlatformFileMetadata read_platform_file_metadata_no_follow(const std::filesystem
     }
     const std::uint64_t size = (static_cast<std::uint64_t>(information.nFileSizeHigh) << 32U) |
                                static_cast<std::uint64_t>(information.nFileSizeLow);
-    return {size, unix_time_nanoseconds(information.ftLastWriteTime, path), 0};
+    FILE_BASIC_INFO basic{};
+    if (::GetFileInformationByHandleEx(handle.get(), FileBasicInfo, &basic, sizeof(basic)) == 0) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to query stable file timestamps (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+    FILETIME changed_time{};
+    changed_time.dwLowDateTime = basic.ChangeTime.LowPart;
+    changed_time.dwHighDateTime = static_cast<DWORD>(basic.ChangeTime.HighPart);
+    const std::uint64_t file_id = (static_cast<std::uint64_t>(information.nFileIndexHigh) << 32U) |
+                                  static_cast<std::uint64_t>(information.nFileIndexLow);
+    return {size,
+            unix_time_nanoseconds(information.ftLastWriteTime, path),
+            unix_time_nanoseconds(changed_time, path),
+            information.dwVolumeSerialNumber,
+            file_id,
+            0};
+}
+
+ScannerPlatformMetadata
+read_scanner_platform_metadata_no_follow(const std::filesystem::path& path) {
+    constexpr DWORD recall_on_open = 0x00040000U;
+    constexpr DWORD recall_on_data_access = 0x00400000U;
+    const DWORD attributes = ::GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect scanner attributes (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+    const bool hidden =
+        (attributes & FILE_ATTRIBUTE_HIDDEN) != 0U || path.filename().native().starts_with(L'.');
+    const bool cloud_placeholder = (attributes & (recall_on_open | recall_on_data_access)) != 0U;
+    if (cloud_placeholder) {
+        return {0, ScannerReparseKind::none, hidden, true};
+    }
+
+    FileHandle handle(::CreateFileW(
+        path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr));
+    if (handle.get() == INVALID_HANDLE_VALUE) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect scanner metadata without following reparse "
+                              "points (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (::GetFileInformationByHandle(handle.get(), &information) == 0) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to query scanner volume identity (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+
+    ScannerReparseKind reparse_kind = ScannerReparseKind::none;
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        reparse_kind = read_scanner_reparse_kind(handle.get(), path);
+    }
+    return {information.dwVolumeSerialNumber, reparse_kind, hidden, false};
+}
+
+bool scanner_paths_are_case_sensitive(const std::filesystem::path&) noexcept {
+    return false;
 }
 
 void apply_restored_metadata(const std::filesystem::path& path, std::int64_t modified_time_ns,

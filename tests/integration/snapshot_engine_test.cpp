@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -18,6 +22,7 @@
 #include "database/database.hpp"
 #include "database/metadata_store.hpp"
 #include "database/statement.hpp"
+#include "filesystem/platform/file_metadata.hpp"
 #include "localvault/error.hpp"
 #include "localvault/repository.hpp"
 #include "localvault/snapshot_engine.hpp"
@@ -33,6 +38,18 @@ class SnapshotEngineTestAccess final {
                                           ByteCount logical_byte_limit) {
         engine.metadata_batch_entry_limit_ = entry_limit;
         engine.metadata_batch_logical_byte_limit_ = logical_byte_limit;
+    }
+
+    static void set_object_race_hooks(SnapshotEngine& engine, std::function<void()> worker,
+                                      std::function<void(bool)> stripe) {
+        engine.worker_test_hook_ = std::move(worker);
+        engine.object_stripe_test_hook_ = std::move(stripe);
+    }
+
+    static void
+    set_file_read_hook(SnapshotEngine& engine,
+                       std::function<void(const std::filesystem::path&, std::size_t)> hook) {
+        engine.file_read_test_hook_ = std::move(hook);
     }
 };
 
@@ -99,6 +116,20 @@ class TestFailureInjector final : public FailureInjector {
     return count;
 }
 
+[[nodiscard]] std::int64_t scalar(Database& database, std::string_view sql) {
+    auto query = database.statement(sql);
+    EXPECT_TRUE(query.step());
+    const std::int64_t value = query.column_int64(0);
+    EXPECT_FALSE(query.step());
+    return value;
+}
+
+[[nodiscard]] std::string hash_text(std::string_view text) {
+    Blake3Hasher hasher;
+    hasher.update(std::as_bytes(std::span(text)));
+    return Blake3Hasher::to_hex(hasher.finalize());
+}
+
 [[nodiscard]] std::string snapshot_status(Database& database, SnapshotId snapshot_id) {
     auto query = database.statement("SELECT status FROM snapshots WHERE id = :id");
     query.bind(":id", snapshot_id);
@@ -106,6 +137,37 @@ class TestFailureInjector final : public FailureInjector {
         return {};
     }
     return query.column_text(0);
+}
+
+TEST(PlatformFileMetadataTest, StableIdentityUsesOnlySizeTimesAndFileId) {
+    const PlatformFileMetadata baseline{
+        .logical_size = 1,
+        .modified_time_ns = 2,
+        .changed_time_ns = 3,
+        .file_id_volume = 4,
+        .file_id_value = 5,
+        .posix_mode = 6,
+    };
+    EXPECT_TRUE(baseline.same_stable_identity(baseline));
+
+    PlatformFileMetadata changed = baseline;
+    ++changed.logical_size;
+    EXPECT_FALSE(baseline.same_stable_identity(changed));
+    changed = baseline;
+    ++changed.modified_time_ns;
+    EXPECT_FALSE(baseline.same_stable_identity(changed));
+    changed = baseline;
+    ++changed.changed_time_ns;
+    EXPECT_FALSE(baseline.same_stable_identity(changed));
+    changed = baseline;
+    ++changed.file_id_volume;
+    EXPECT_FALSE(baseline.same_stable_identity(changed));
+    changed = baseline;
+    ++changed.file_id_value;
+    EXPECT_FALSE(baseline.same_stable_identity(changed));
+    changed = baseline;
+    ++changed.posix_mode;
+    EXPECT_TRUE(baseline.same_stable_identity(changed));
 }
 
 TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedZstdChunksAndFileHashes) {
@@ -253,6 +315,239 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedZstdChunksAndFi
 #endif
 }
 
+TEST(SnapshotEngineTest, ForcedSixteenWorkerDuplicateRacePublishesOneObjectAndOneChunkRow) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder builder(source);
+    for (std::size_t index = 0; index < 16U; ++index) {
+        builder.text_file("same-" + std::to_string(index), "identical race contents");
+    }
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::size_t workers_ready = 0;
+    std::size_t stores_ready = 0;
+    SnapshotEngineTestAccess::set_object_race_hooks(
+        engine,
+        [&] {
+            std::unique_lock lock(mutex);
+            ++workers_ready;
+            condition.notify_all();
+            condition.wait(lock, [&] { return workers_ready == 16U; });
+        },
+        [&](bool inside_stripe) {
+            std::unique_lock lock(mutex);
+            if (!inside_stripe) {
+                ++stores_ready;
+                condition.notify_all();
+                return;
+            }
+            condition.wait(lock, [&] { return stores_ready == 16U; });
+        });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 16});
+
+    EXPECT_EQ(result.file_count, 16U);
+    EXPECT_EQ(result.new_chunks, 1U);
+    EXPECT_EQ(result.reused_chunks, 15U);
+    EXPECT_EQ(count_zstd_objects(repository_root), 1U);
+    Database database(repository_root / "repository.db");
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM chunks"), 1);
+}
+
+TEST(SnapshotEngineTest, EqualPreAndPostIdentityCompletesAfterOneRead) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source).text_file("stable.txt", "stable contents");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::atomic<std::size_t> reads{0};
+    SnapshotEngineTestAccess::set_file_read_hook(
+        engine, [&](const std::filesystem::path&, std::size_t) { reads.fetch_add(1); });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 1});
+
+    EXPECT_EQ(reads.load(), 1U);
+    EXPECT_EQ(result.file_count, 1U);
+    EXPECT_TRUE(result.skipped_entries.empty());
+}
+
+TEST(SnapshotEngineTest, OneIdentityChangeRetriesAndStoresOnlySecondStableVersion) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    const std::filesystem::path changing = source / "changing.txt";
+    constexpr std::string_view stable_contents = "second stable version";
+    test::DatasetBuilder(source).text_file("changing.txt", "first");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::atomic<std::size_t> reads{0};
+    SnapshotEngineTestAccess::set_file_read_hook(
+        engine, [&](const std::filesystem::path& path, std::size_t attempt) {
+            reads.fetch_add(1);
+            if (attempt == 0U) {
+                std::ofstream(path, std::ios::binary | std::ios::trunc) << stable_contents;
+            }
+        });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 1});
+
+    EXPECT_EQ(reads.load(), 2U);
+    EXPECT_EQ(result.file_count, 1U);
+    EXPECT_EQ(result.new_chunks, 1U);
+    EXPECT_EQ(result.reused_chunks, 0U);
+    EXPECT_TRUE(result.skipped_entries.empty());
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    const std::vector<EntryInfo> entries = metadata.list_entries(result.snapshot_id);
+    const EntryInfo* stored = find_entry(entries, "changing.txt");
+    ASSERT_NE(stored, nullptr);
+    EXPECT_EQ(stored->logical_size, stable_contents.size());
+    ASSERT_TRUE(stored->file_hash_hex.has_value());
+    EXPECT_EQ(*stored->file_hash_hex, hash_text(stable_contents));
+    EXPECT_EQ(count_zstd_objects(repository_root), 2U);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM chunks"), 1);
+}
+
+TEST(SnapshotEngineTest, TwoIdentityChangesWarnAndSkipWithoutEntryMetadata) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source).text_file("changing.txt", "first");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::atomic<std::size_t> reads{0};
+    SnapshotEngineTestAccess::set_file_read_hook(
+        engine, [&](const std::filesystem::path& path, std::size_t attempt) {
+            reads.fetch_add(1);
+            std::ofstream(path, std::ios::binary | std::ios::trunc)
+                << (attempt == 0U ? "changed once" : "changed twice and still unstable");
+        });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 1});
+
+    EXPECT_EQ(reads.load(), 2U);
+    EXPECT_EQ(result.file_count, 0U);
+    EXPECT_EQ(result.new_chunks, 0U);
+    EXPECT_EQ(result.reused_chunks, 0U);
+    ASSERT_EQ(result.skipped_entries.size(), 1U);
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    EXPECT_EQ(find_entry(metadata.list_entries(result.snapshot_id), "changing.txt"), nullptr);
+    EXPECT_EQ(count_zstd_objects(repository_root), 2U);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM chunks"), 0);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM snapshot_warnings"), 1);
+    EXPECT_NO_THROW((void)metadata.require_complete_snapshot(result.snapshot_id));
+}
+
+TEST(SnapshotEngineTest, DisappearingFileWarnsAndSkipsWithoutMixedEntry) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source).text_file("disappears.txt", "contents");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::atomic<std::size_t> complete_reads{0};
+    SnapshotEngineTestAccess::set_file_read_hook(
+        engine, [&](const std::filesystem::path& path, std::size_t) {
+            complete_reads.fetch_add(1);
+            std::filesystem::remove(path);
+        });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 1});
+
+    EXPECT_EQ(complete_reads.load(), 1U);
+    EXPECT_EQ(result.file_count, 0U);
+    EXPECT_EQ(result.new_chunks, 0U);
+    EXPECT_EQ(result.reused_chunks, 0U);
+    ASSERT_EQ(result.skipped_entries.size(), 1U);
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    EXPECT_EQ(find_entry(metadata.list_entries(result.snapshot_id), "disappears.txt"), nullptr);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM chunks"), 0);
+    EXPECT_NO_THROW((void)metadata.require_complete_snapshot(result.snapshot_id));
+}
+
+TEST(SnapshotEngineTest, PermissionAndSharingSourceErrorsWarnAndSkip) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source)
+        .text_file("permission-denied.txt", "permission")
+        .text_file("sharing-violation.txt", "sharing");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::atomic<std::size_t> complete_reads{0};
+    SnapshotEngineTestAccess::set_file_read_hook(engine, [&](const std::filesystem::path& path,
+                                                             std::size_t) {
+        complete_reads.fetch_add(1);
+        const bool sharing = path.filename() == "sharing-violation.txt";
+        throw LocalVaultError(
+            ErrorCode::filesystem_error,
+            sharing ? "injected Windows sharing violation" : "injected permission denied", path);
+    });
+
+    const SnapshotResult result =
+        engine.create_snapshot(source, SnapshotOptions{.worker_count = 2});
+
+    EXPECT_EQ(complete_reads.load(), 4U);
+    EXPECT_EQ(result.file_count, 0U);
+    EXPECT_EQ(result.new_chunks, 0U);
+    EXPECT_EQ(result.reused_chunks, 0U);
+    EXPECT_EQ(result.skipped_entries.size(), 2U);
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    EXPECT_EQ(metadata.list_entries(result.snapshot_id).size(), 1U);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM chunks"), 0);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM snapshot_warnings"), 2);
+    EXPECT_NO_THROW((void)metadata.require_complete_snapshot(result.snapshot_id));
+}
+
+TEST(SnapshotEngineTest, CancellationDuringChunkProcessingLeavesNoCompleteSnapshot) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source).repeated_file("large.bin", 32U, std::byte{0x5A});
+    RepositoryCreateOptions create_options;
+    create_options.chunk_size_bytes = 8U;
+    Repository::create(repository_root, create_options);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    SnapshotEngine engine(repository);
+    std::stop_source stop;
+    SnapshotEngineTestAccess::set_object_race_hooks(engine, {}, [&](bool inside_stripe) {
+        if (inside_stripe) {
+            stop.request_stop();
+        }
+    });
+
+    try {
+        (void)engine.create_snapshot(source, SnapshotOptions{.worker_count = 1}, stop.get_token());
+        FAIL() << "cancelled chunk processing unexpectedly succeeded";
+    } catch (const LocalVaultError& error) {
+        EXPECT_EQ(error.code(), ErrorCode::cancelled);
+    }
+
+    Database database(repository_root / "repository.db");
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM snapshots WHERE status = 'cancelled'"), 1);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM snapshots WHERE status = 'complete'"), 0);
+    EXPECT_EQ(scalar(database, "SELECT COUNT(*) FROM entries"), 0);
+}
+
 TEST(SnapshotEngineTest, RejectsReadOnlyInvalidAndContainedSources) {
     test::TemporaryDirectory temporary;
     const std::filesystem::path source = temporary.path() / "source";
@@ -376,6 +671,37 @@ TEST(SnapshotEngineTest, TinyBatchOverrideCommitsMultipleBatchesBeforePublishing
     MetadataStore metadata(database);
     EXPECT_EQ(metadata.require_complete_snapshot(result.snapshot_id).id, result.snapshot_id);
     EXPECT_EQ(metadata.list_entries(result.snapshot_id).size(), 6U);
+}
+
+TEST(SnapshotEngineTest, StreamsHiddenAndReplacementIgnoreOptionsIntoScanner) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    const std::filesystem::path replacement = temporary.path() / "replacement.ignore";
+    test::DatasetBuilder(source)
+        .text_file("visible.txt", "visible")
+        .text_file(".hidden.txt", "hidden")
+        .text_file("root-rule.txt", "kept because root rules are replaced")
+        .text_file("replacement-rule.txt", "ignored");
+    std::ofstream(source / ".localvaultignore") << "root-rule.txt\n";
+    std::ofstream(replacement) << "replacement-rule.txt\n";
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+
+    const SnapshotResult result =
+        SnapshotEngine(repository)
+            .create_snapshot(source,
+                             SnapshotOptions{.include_hidden = false, .ignore_file = replacement});
+
+    EXPECT_EQ(result.file_count, 2U);
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    const std::vector<EntryInfo> entries = metadata.list_entries(result.snapshot_id);
+    EXPECT_NE(find_entry(entries, "visible.txt"), nullptr);
+    EXPECT_NE(find_entry(entries, "root-rule.txt"), nullptr);
+    EXPECT_EQ(find_entry(entries, ".hidden.txt"), nullptr);
+    EXPECT_EQ(find_entry(entries, ".localvaultignore"), nullptr);
+    EXPECT_EQ(find_entry(entries, "replacement-rule.txt"), nullptr);
 }
 
 #ifndef _WIN32

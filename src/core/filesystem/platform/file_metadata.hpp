@@ -11,7 +11,31 @@ namespace localvault {
 struct PlatformFileMetadata {
     std::uint64_t logical_size{};
     std::int64_t modified_time_ns{};
+    std::int64_t changed_time_ns{};
+    std::uint64_t file_id_volume{};
+    std::uint64_t file_id_value{};
     std::uint32_t posix_mode{};
+
+    [[nodiscard]] bool same_stable_identity(const PlatformFileMetadata& other) const noexcept {
+        return logical_size == other.logical_size && modified_time_ns == other.modified_time_ns &&
+               changed_time_ns == other.changed_time_ns && file_id_volume == other.file_id_volume &&
+               file_id_value == other.file_id_value;
+    }
+};
+
+enum class ScannerReparseKind {
+    none,
+    symbolic_link,
+    junction,
+    volume_mount_point,
+    other,
+};
+
+struct ScannerPlatformMetadata {
+    std::uint64_t filesystem_identity{};
+    ScannerReparseKind reparse_kind{ScannerReparseKind::none};
+    bool hidden{false};
+    bool cloud_placeholder{false};
 };
 
 enum class RestorePublishResult {
@@ -44,6 +68,10 @@ class TemporaryOutputFile final {
 
 [[nodiscard]] PlatformFileMetadata
 read_platform_file_metadata_no_follow(const std::filesystem::path& path);
+[[nodiscard]] ScannerPlatformMetadata
+read_scanner_platform_metadata_no_follow(const std::filesystem::path& path);
+[[nodiscard]] bool
+scanner_paths_are_case_sensitive(const std::filesystem::path& source_root) noexcept;
 void apply_restored_metadata(const std::filesystem::path& path, std::int64_t modified_time_ns,
                              std::uint32_t posix_mode);
 [[nodiscard]] bool create_restored_symlink(const std::filesystem::path& target,

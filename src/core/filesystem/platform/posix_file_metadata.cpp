@@ -212,18 +212,53 @@ PlatformFileMetadata read_platform_file_metadata_no_follow(const std::filesystem
     }
 
 #if defined(__APPLE__)
-    const std::int64_t seconds = information.st_mtimespec.tv_sec;
-    const std::int64_t nanoseconds = information.st_mtimespec.tv_nsec;
+    const std::int64_t modified_seconds = information.st_mtimespec.tv_sec;
+    const std::int64_t modified_nanoseconds = information.st_mtimespec.tv_nsec;
+    const std::int64_t changed_seconds = information.st_ctimespec.tv_sec;
+    const std::int64_t changed_nanoseconds = information.st_ctimespec.tv_nsec;
 #else
-    const std::int64_t seconds = information.st_mtim.tv_sec;
-    const std::int64_t nanoseconds = information.st_mtim.tv_nsec;
+    const std::int64_t modified_seconds = information.st_mtim.tv_sec;
+    const std::int64_t modified_nanoseconds = information.st_mtim.tv_nsec;
+    const std::int64_t changed_seconds = information.st_ctim.tv_sec;
+    const std::int64_t changed_nanoseconds = information.st_ctim.tv_nsec;
 #endif
 
     return {
         static_cast<std::uint64_t>(information.st_size),
-        nanoseconds_since_epoch(seconds, nanoseconds, path),
+        nanoseconds_since_epoch(modified_seconds, modified_nanoseconds, path),
+        nanoseconds_since_epoch(changed_seconds, changed_nanoseconds, path),
+        static_cast<std::uint64_t>(information.st_dev),
+        static_cast<std::uint64_t>(information.st_ino),
         static_cast<std::uint32_t>(information.st_mode),
     };
+}
+
+ScannerPlatformMetadata
+read_scanner_platform_metadata_no_follow(const std::filesystem::path& path) {
+    struct stat information{};
+    if (::lstat(path.c_str(), &information) != 0) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect scanner metadata without following symlinks: " +
+                                  std::generic_category().message(errno),
+                              path);
+    }
+    return {
+        static_cast<std::uint64_t>(information.st_dev),
+        S_ISLNK(information.st_mode) ? ScannerReparseKind::symbolic_link : ScannerReparseKind::none,
+        path.filename().native().starts_with('.'),
+        false,
+    };
+}
+
+bool scanner_paths_are_case_sensitive(const std::filesystem::path& source_root) noexcept {
+#if defined(__APPLE__)
+    errno = 0;
+    const long result = ::pathconf(source_root.c_str(), _PC_CASE_SENSITIVE);
+    return result == -1 ? true : result != 0;
+#else
+    (void)source_root;
+    return true;
+#endif
 }
 
 void apply_restored_metadata(const std::filesystem::path& path, std::int64_t modified_time_ns,

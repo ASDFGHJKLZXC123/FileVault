@@ -3,16 +3,19 @@ add_executable(
     integration/lock_contention_test.cpp
     integration/m4_crash_safety_test.cpp
     integration/m3_large_file_roundtrip_test.cpp
+    integration/m5_pipeline_test.cpp
     integration/repository_test.cpp
     integration/restore_engine_test.cpp
     integration/snapshot_engine_test.cpp
     integration/snapshot_restore_acceptance_test.cpp
     support/test_filesystem.cpp
     unit/blake3_hasher_test.cpp
+    unit/bounded_queue_test.cpp
     unit/chunker_test.cpp
     unit/database_test.cpp
     unit/file_scanner_test.cpp
     unit/filesystem_classifier_test.cpp
+    unit/ignore_rules_test.cpp
     unit/metadata_store_test.cpp
     unit/migrations_test.cpp
     unit/object_store_test.cpp

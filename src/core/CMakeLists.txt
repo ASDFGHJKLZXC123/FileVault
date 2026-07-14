@@ -26,6 +26,7 @@ add_library(
     database/transaction.cpp
     filesystem/filesystem_classifier.cpp
     filesystem/file_scanner.cpp
+    filesystem/ignore_rules.cpp
     repository.cpp
     restore_engine.cpp
     snapshot_engine.cpp
