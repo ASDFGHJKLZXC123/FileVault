@@ -60,7 +60,12 @@ In an Administrator `cmd.exe` on a clean Windows VM: `mkdir C:\lv-m5-junction\so
 C:\lv-m5-junction\source\loop C:\lv-m5-junction\source`. Confirm with `fsutil reparsepoint query
 C:\lv-m5-junction\source\loop`, build `cmake --preset windows-development
 -DLOCALVAULT_WARNINGS_AS_ERRORS=ON` and `cmake --build --preset windows-development-debug
---parallel`, then run `build\windows-development\tests\Debug\localvault_tests.exe
---gtest_filter=FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed`. It must pass
-without recursion. Remove only the junction with `rmdir C:\lv-m5-junction\source\loop` (never
-`rmdir /S` through the loop), then remove the fixture. **Human result: pending.**
+--parallel`, then set `set LOCALVAULT_M5_JUNCTION_LOOP_SOURCE=C:\lv-m5-junction\source`. Run the
+named test with a 30-second watchdog:
+`powershell -NoProfile -Command "$p=Start-Process -FilePath
+'build\windows-development\tests\Debug\localvault_tests.exe' -ArgumentList
+'--gtest_filter=FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed' -NoNewWindow
+-PassThru; if(-not $p.WaitForExit(30000)){$p.Kill(); throw 'junction-loop scan did not terminate'};
+exit $p.ExitCode"`. It must pass and terminate without recursing into `loop\file.txt`. Remove only
+the junction with `rmdir C:\lv-m5-junction\source\loop` (never `rmdir /S` through the loop), then
+remove the fixture. **Human result: pending.**

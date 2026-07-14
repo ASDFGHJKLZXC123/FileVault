@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -289,23 +290,37 @@ TEST(FileScannerTest, ExplicitIgnoreFileReplacesRootRules) {
 #ifdef _WIN32
 TEST(FileScannerTest, NativeWindowsJunctionIsCapturedAndNeverTraversed) {
     test::TemporaryDirectory temporary;
-    const std::filesystem::path source = temporary.path() / "source";
+    std::filesystem::path source;
+    std::string junction_name;
+    std::string nested_name;
+    const char* configured_source = std::getenv("LOCALVAULT_M5_JUNCTION_LOOP_SOURCE");
+    if (configured_source != nullptr && configured_source[0] != '\0') {
+        source = configured_source;
+        junction_name = "loop";
+        nested_name = "loop/file.txt";
+        ASSERT_TRUE(std::filesystem::is_regular_file(source / "file.txt"));
+    } else {
+        source = temporary.path() / "source";
+        junction_name = "junction";
+        nested_name = "junction/inside.txt";
+    }
     const std::filesystem::path target = temporary.path() / "target";
-    test::DatasetBuilder(source).text_file("ordinary.txt", "ordinary");
-    test::DatasetBuilder(target).text_file("inside.txt", "must not traverse");
-    const std::filesystem::path junction = source / "junction";
-    if (!create_junction(junction, target)) {
-        GTEST_SKIP() << "mklink /J is unavailable in this Windows environment";
+    if (configured_source == nullptr || configured_source[0] == '\0') {
+        test::DatasetBuilder(source).text_file("ordinary.txt", "ordinary");
+        test::DatasetBuilder(target).text_file("inside.txt", "must not traverse");
+        if (!create_junction(source / junction_name, target)) {
+            GTEST_SKIP() << "mklink /J is unavailable in this Windows environment";
+        }
     }
 
     const ScanResult result = FileScanner{}.scan(source);
 
-    const ScannedEntry* entry = find_entry(result, "junction");
+    const ScannedEntry* entry = find_entry(result, junction_name);
     ASSERT_NE(entry, nullptr);
     EXPECT_EQ(entry->type, EntryType::symbolic_link);
     EXPECT_TRUE(entry->symlink_target.has_value());
     EXPECT_FALSE(entry->symlink_target->empty());
-    EXPECT_EQ(find_entry(result, "junction/inside.txt"), nullptr);
+    EXPECT_EQ(find_entry(result, nested_name), nullptr);
 }
 #endif
 
