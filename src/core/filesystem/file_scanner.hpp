@@ -39,7 +39,7 @@ struct ScanResult {
 struct FileScannerOptions {
     bool include_hidden{true};
     bool one_file_system{false};
-    std::optional<std::filesystem::path> ignore_file;
+    std::optional<std::filesystem::path> ignore_file{};
 };
 
 enum class ScanEntryKind {
