@@ -1,14 +1,16 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 
+#include "localvault/failure_injector.hpp"
+
 namespace localvault {
 
 class Database;
-class FailureInjector;
 
 struct RepositoryCreateOptions {
     std::uint64_t chunk_size_bytes{4ULL * 1024ULL * 1024ULL};
@@ -52,6 +54,9 @@ class Repository final {
     explicit Repository(std::unique_ptr<Impl> impl);
     [[nodiscard]] Database& database() noexcept;
     [[nodiscard]] OpenMode open_mode() const noexcept;
+    [[nodiscard]] std::shared_ptr<FailureInjector> failure_injector() const noexcept;
+    void recover_after_writer_lock();
+    void set_recovery_entry_batch_limit_for_testing(std::size_t entry_batch_limit);
     std::unique_ptr<Impl> impl_;
 
     friend class SnapshotEngine;

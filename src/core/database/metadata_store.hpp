@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -12,8 +13,14 @@
 namespace localvault {
 
 class Database;
+class FailureInjector;
 class ObjectStore;
 struct ScannedEntry;
+
+struct IncompleteSnapshotInfo {
+    SnapshotId id{};
+    SnapshotStatus status{SnapshotStatus::pending};
+};
 
 struct SnapshotTotals {
     std::uint64_t file_count{};
@@ -53,10 +60,24 @@ class MetadataStore final {
                                                      std::int64_t created_at_ns) const;
     void mark_snapshot_complete(SnapshotId snapshot_id, const SnapshotTotals& totals,
                                 std::int64_t completed_at_ns) const;
-    void mark_snapshot_failed(SnapshotId snapshot_id, std::string_view failure_message,
-                              std::int64_t completed_at_ns) const;
+    void mark_snapshot_incomplete(SnapshotId snapshot_id, SnapshotStatus status,
+                                  std::string_view failure_message,
+                                  std::int64_t completed_at_ns) const;
     [[nodiscard]] SnapshotSummary require_complete_snapshot(SnapshotId snapshot_id) const;
     [[nodiscard]] std::vector<SnapshotSummary> list_complete_snapshots() const;
+
+    void transition_snapshot_to_deleting(SnapshotId snapshot_id,
+                                         FailureInjector& failure_injector) const;
+    void delete_deleting_snapshot(SnapshotId snapshot_id, FailureInjector& failure_injector,
+                                  std::size_t entry_batch_limit = 10'000) const;
+    [[nodiscard]] std::vector<IncompleteSnapshotInfo> list_incomplete_snapshots() const;
+    void mark_stale_pending_snapshot_failed(SnapshotId snapshot_id,
+                                            std::string_view failure_message,
+                                            std::int64_t completed_at_ns,
+                                            FailureInjector& failure_injector) const;
+    void clean_incomplete_snapshot(SnapshotId snapshot_id, FailureInjector& failure_injector,
+                                   std::size_t entry_batch_limit = 10'000) const;
+    void quick_relationship_check() const;
 
     [[nodiscard]] std::int64_t insert_entry(SnapshotId snapshot_id,
                                             const ScannedEntry& entry) const;

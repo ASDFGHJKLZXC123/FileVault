@@ -1,6 +1,7 @@
 add_executable(
     localvault_tests
     integration/lock_contention_test.cpp
+    integration/m4_crash_safety_test.cpp
     integration/m3_large_file_roundtrip_test.cpp
     integration/repository_test.cpp
     integration/restore_engine_test.cpp
@@ -30,6 +31,16 @@ add_executable(
     support/repository_probe.cpp
 )
 
+add_executable(
+    localvault_m4_recovery_probe
+    support/localvault_m4_recovery_probe.cpp
+)
+
+add_executable(
+    localvault_m4_crash_helper
+    support/localvault_m4_crash_helper.cpp
+)
+
 target_link_libraries(
     localvault_lock_contention_helper
     PRIVATE
@@ -40,6 +51,24 @@ target_link_libraries(
     localvault_repository_probe
     PRIVATE
         LocalVault::core
+)
+
+target_link_libraries(
+    localvault_m4_recovery_probe
+    PRIVATE
+        LocalVault::core
+)
+
+target_link_libraries(
+    localvault_m4_crash_helper
+    PRIVATE
+        LocalVault::core
+)
+
+target_include_directories(
+    localvault_m4_recovery_probe
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/core"
 )
 
 target_include_directories(
@@ -66,9 +95,10 @@ target_compile_definitions(
     localvault_tests
     PRIVATE
         LOCALVAULT_LOCK_HELPER_PATH="$<TARGET_FILE:localvault_lock_contention_helper>"
+        LOCALVAULT_M4_CRASH_HELPER_PATH="$<TARGET_FILE:localvault_m4_crash_helper>"
 )
 
-add_dependencies(localvault_tests localvault_lock_contention_helper)
+add_dependencies(localvault_tests localvault_lock_contention_helper localvault_m4_crash_helper)
 
 include(GoogleTest)
 gtest_discover_tests(localvault_tests)
@@ -84,3 +114,11 @@ localvault_enable_clang_tidy(localvault_lock_contention_helper)
 localvault_set_warnings(localvault_repository_probe)
 localvault_enable_sanitizers(localvault_repository_probe)
 localvault_enable_clang_tidy(localvault_repository_probe)
+
+localvault_set_warnings(localvault_m4_recovery_probe)
+localvault_enable_sanitizers(localvault_m4_recovery_probe)
+localvault_enable_clang_tidy(localvault_m4_recovery_probe)
+
+localvault_set_warnings(localvault_m4_crash_helper)
+localvault_enable_sanitizers(localvault_m4_crash_helper)
+localvault_enable_clang_tidy(localvault_m4_crash_helper)

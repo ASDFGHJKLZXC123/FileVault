@@ -42,7 +42,15 @@ class SnapshotEngine final {
                                    ProgressCallback progress = {});
 
   private:
+    friend class SnapshotEngineTestAccess;
+
+    static constexpr std::size_t default_metadata_batch_entry_limit = 500;
+    static constexpr ByteCount default_metadata_batch_logical_byte_limit =
+        64ULL * 1024ULL * 1024ULL;
+
     Repository& repository_;
+    std::size_t metadata_batch_entry_limit_{default_metadata_batch_entry_limit};
+    ByteCount metadata_batch_logical_byte_limit_{default_metadata_batch_logical_byte_limit};
 };
 
 } // namespace localvault

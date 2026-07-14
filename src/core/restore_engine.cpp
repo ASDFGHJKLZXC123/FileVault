@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -557,6 +558,7 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
 
     RepositoryLock writer_lock =
         RepositoryLock::acquire_exclusive(repository_.root() / "repository.lock");
+    repository_.recover_after_writer_lock();
     MetadataStore metadata(repository_.database());
     (void)metadata.require_complete_snapshot(request.snapshot_id);
     const std::vector<EntryInfo> entries = metadata.list_entries(request.snapshot_id);
@@ -584,8 +586,9 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
     std::vector<PlannedEntry> plan = build_plan(request, destination_root, std::move(selected));
     const std::uint64_t total_entries = plan.size();
     RestoreResult result;
+    const std::shared_ptr<FailureInjector> failure_injector = repository_.failure_injector();
     ObjectStore objects(repository_.root(), repository_.info().chunk_size_bytes,
-                        repository_.info().zstd_level);
+                        repository_.info().zstd_level, failure_injector);
     report_progress(progress, OperationPhase::restoring, destination_root, result, total_entries);
 
     for (const PlannedEntry& planned : plan) {
@@ -635,6 +638,7 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
                                       entry.relative_path);
             }
             output.write(raw);
+            failure_injector->hit(FailurePoint::during_restore_write);
             full_file_hasher.update(raw);
             written = checked_add(written, chunk.raw_length, entry.relative_path);
         }

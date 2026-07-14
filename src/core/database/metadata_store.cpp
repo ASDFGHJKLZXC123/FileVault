@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -12,8 +13,10 @@
 
 #include "database/database.hpp"
 #include "database/statement.hpp"
+#include "database/transaction.hpp"
 #include "filesystem/file_scanner.hpp"
 #include "localvault/error.hpp"
+#include "localvault/failure_injector.hpp"
 
 namespace localvault {
 namespace {
@@ -133,6 +136,23 @@ namespace {
     return snapshot;
 }
 
+[[nodiscard]] SnapshotStatus snapshot_status_from_storage(std::string_view status) {
+    if (status == "pending") {
+        return SnapshotStatus::pending;
+    }
+    if (status == "failed") {
+        return SnapshotStatus::failed;
+    }
+    if (status == "cancelled") {
+        return SnapshotStatus::cancelled;
+    }
+    if (status == "deleting") {
+        return SnapshotStatus::deleting;
+    }
+    throw LocalVaultError(ErrorCode::database_error,
+                          "database contains an unexpected incomplete snapshot status");
+}
+
 void require_single_updated_row(Statement& statement, std::string_view action) {
     if (!statement.step()) {
         throw LocalVaultError(ErrorCode::invalid_argument,
@@ -151,6 +171,45 @@ void require_single_updated_row(Statement& statement, std::string_view action) {
         entries.push_back(read_entry(query));
     }
     return entries;
+}
+
+[[nodiscard]] std::int64_t checked_batch_limit(std::size_t entry_batch_limit) {
+    if (entry_batch_limit == 0 ||
+        entry_batch_limit > static_cast<std::size_t>((std::numeric_limits<std::int64_t>::max)())) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "snapshot entry batch limit is outside the supported range");
+    }
+    return static_cast<std::int64_t>(entry_batch_limit);
+}
+
+[[nodiscard]] std::size_t delete_entry_batch(Database& database, SnapshotId snapshot_id,
+                                             std::int64_t entry_batch_limit) {
+    auto remove = database.statement(
+        "DELETE FROM entries WHERE id IN (SELECT id FROM entries "
+        "WHERE snapshot_id = :snapshot_id ORDER BY id LIMIT :entry_batch_limit) RETURNING id");
+    remove.bind(":snapshot_id", snapshot_id);
+    remove.bind(":entry_batch_limit", entry_batch_limit);
+    std::size_t removed = 0;
+    while (remove.step()) {
+        (void)remove.column_int64(0);
+        ++removed;
+    }
+    return removed;
+}
+
+[[nodiscard]] std::size_t delete_warning_batch(Database& database, SnapshotId snapshot_id,
+                                               std::int64_t warning_batch_limit) {
+    auto remove = database.statement(
+        "DELETE FROM snapshot_warnings WHERE id IN (SELECT id FROM snapshot_warnings "
+        "WHERE snapshot_id = :snapshot_id ORDER BY id LIMIT :warning_batch_limit) RETURNING id");
+    remove.bind(":snapshot_id", snapshot_id);
+    remove.bind(":warning_batch_limit", warning_batch_limit);
+    std::size_t removed = 0;
+    while (remove.step()) {
+        (void)remove.column_int64(0);
+        ++removed;
+    }
+    return removed;
 }
 
 constexpr std::string_view entry_projection =
@@ -182,6 +241,29 @@ SnapshotId MetadataStore::create_pending_snapshot(std::string_view source_root,
 
 void MetadataStore::mark_snapshot_complete(SnapshotId snapshot_id, const SnapshotTotals& totals,
                                            std::int64_t completed_at_ns) const {
+    auto count_entries = database_.statement(
+        "SELECT COALESCE(SUM(CASE WHEN entry_type = 'file' THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(CASE WHEN entry_type = 'directory' THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(CASE WHEN entry_type = 'symlink' THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(CASE WHEN entry_type = 'file' THEN logical_size ELSE 0 END), 0) "
+        "FROM entries WHERE snapshot_id = :snapshot_id");
+    count_entries.bind(":snapshot_id", snapshot_id);
+    if (!count_entries.step()) {
+        throw LocalVaultError(ErrorCode::database_error, "snapshot counter query returned no row");
+    }
+    SnapshotTotals final_totals = totals;
+    final_totals.file_count = checked_uint64(count_entries.column_int64(0), "snapshot file count");
+    final_totals.directory_count =
+        checked_uint64(count_entries.column_int64(1), "snapshot directory count");
+    final_totals.symlink_count =
+        checked_uint64(count_entries.column_int64(2), "snapshot symlink count");
+    final_totals.logical_size =
+        checked_byte_count(count_entries.column_int64(3), "snapshot logical size");
+    if (count_entries.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "snapshot counter query returned multiple rows");
+    }
+
     auto update = database_.statement(
         "UPDATE snapshots SET completed_at_ns = :completed_at_ns, status = 'complete', "
         "file_count = :file_count, directory_count = :directory_count, "
@@ -192,31 +274,40 @@ void MetadataStore::mark_snapshot_complete(SnapshotId snapshot_id, const Snapsho
         "(SELECT 1 FROM entries WHERE snapshot_id = :snapshot_id "
         "AND entry_type = 'file' AND file_hash IS NULL) RETURNING id");
     update.bind(":completed_at_ns", completed_at_ns);
-    update.bind(":file_count", checked_int64(totals.file_count, "snapshot file count"));
+    update.bind(":file_count", checked_int64(final_totals.file_count, "snapshot file count"));
     update.bind(":directory_count",
-                checked_int64(totals.directory_count, "snapshot directory count"));
-    update.bind(":symlink_count", checked_int64(totals.symlink_count, "snapshot symlink count"));
-    update.bind(":logical_size", checked_int64(totals.logical_size, "snapshot logical size"));
-    update.bind(":new_stored_size", checked_int64(totals.new_stored_size, "snapshot stored size"));
+                checked_int64(final_totals.directory_count, "snapshot directory count"));
+    update.bind(":symlink_count",
+                checked_int64(final_totals.symlink_count, "snapshot symlink count"));
+    update.bind(":logical_size", checked_int64(final_totals.logical_size, "snapshot logical size"));
+    update.bind(":new_stored_size",
+                checked_int64(final_totals.new_stored_size, "snapshot stored size"));
     update.bind(":new_chunk_count",
-                checked_int64(totals.new_chunk_count, "snapshot new chunk count"));
+                checked_int64(final_totals.new_chunk_count, "snapshot new chunk count"));
     update.bind(":reused_chunk_count",
-                checked_int64(totals.reused_chunk_count, "snapshot reused chunk count"));
-    update.bind(":duration_ms", totals.duration_ms);
+                checked_int64(final_totals.reused_chunk_count, "snapshot reused chunk count"));
+    update.bind(":duration_ms", final_totals.duration_ms);
     update.bind(":snapshot_id", snapshot_id);
     require_single_updated_row(update, "completing a snapshot");
 }
 
-void MetadataStore::mark_snapshot_failed(SnapshotId snapshot_id, std::string_view failure_message,
-                                         std::int64_t completed_at_ns) const {
+void MetadataStore::mark_snapshot_incomplete(SnapshotId snapshot_id, SnapshotStatus status,
+                                             std::string_view failure_message,
+                                             std::int64_t completed_at_ns) const {
+    if (status != SnapshotStatus::failed && status != SnapshotStatus::cancelled) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "an incomplete snapshot must be failed or cancelled");
+    }
+
     auto update = database_.statement(
-        "UPDATE snapshots SET completed_at_ns = :completed_at_ns, status = 'failed', "
+        "UPDATE snapshots SET completed_at_ns = :completed_at_ns, status = :status, "
         "failure_message = :failure_message "
         "WHERE id = :snapshot_id AND status = 'pending' RETURNING id");
     update.bind(":completed_at_ns", completed_at_ns);
+    update.bind(":status", status == SnapshotStatus::cancelled ? "cancelled" : "failed");
     update.bind(":failure_message", failure_message);
     update.bind(":snapshot_id", snapshot_id);
-    require_single_updated_row(update, "failing a snapshot");
+    require_single_updated_row(update, "finishing an incomplete snapshot");
 }
 
 SnapshotSummary MetadataStore::require_complete_snapshot(SnapshotId snapshot_id) const {
@@ -247,6 +338,212 @@ std::vector<SnapshotSummary> MetadataStore::list_complete_snapshots() const {
         snapshots.push_back(read_snapshot(query));
     }
     return snapshots;
+}
+
+void MetadataStore::transition_snapshot_to_deleting(SnapshotId snapshot_id,
+                                                    FailureInjector& failure_injector) const {
+    Transaction transaction(database_);
+    auto update =
+        database_.statement("UPDATE snapshots SET status = 'deleting' "
+                            "WHERE id = :snapshot_id AND status = 'complete' RETURNING id");
+    update.bind(":snapshot_id", snapshot_id);
+    if (!update.step()) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "deleting requires an existing complete snapshot");
+    }
+    (void)update.column_int64(0);
+    if (update.step()) {
+        throw LocalVaultError(ErrorCode::database_error, "deleting updated multiple snapshots");
+    }
+    failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+    transaction.commit();
+}
+
+void MetadataStore::delete_deleting_snapshot(SnapshotId snapshot_id,
+                                             FailureInjector& failure_injector,
+                                             std::size_t entry_batch_limit) const {
+    const std::int64_t batch_limit = checked_batch_limit(entry_batch_limit);
+    for (;;) {
+        Transaction transaction(database_);
+        auto status = database_.statement(
+            "SELECT 1 FROM snapshots WHERE id = :snapshot_id AND status = 'deleting'");
+        status.bind(":snapshot_id", snapshot_id);
+        if (!status.step()) {
+            throw LocalVaultError(ErrorCode::invalid_argument,
+                                  "resuming deletion requires a deleting snapshot");
+        }
+        if (status.step()) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "deleting snapshot identifier selected multiple rows");
+        }
+
+        const std::size_t removed = delete_entry_batch(database_, snapshot_id, batch_limit);
+        failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+        transaction.commit();
+        if (removed == 0) {
+            break;
+        }
+    }
+
+    for (;;) {
+        Transaction transaction(database_);
+        auto status = database_.statement(
+            "SELECT 1 FROM snapshots WHERE id = :snapshot_id AND status = 'deleting'");
+        status.bind(":snapshot_id", snapshot_id);
+        if (!status.step()) {
+            throw LocalVaultError(ErrorCode::invalid_argument,
+                                  "resuming deletion requires a deleting snapshot");
+        }
+        if (status.step()) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "deleting snapshot identifier selected multiple rows");
+        }
+
+        const std::size_t removed = delete_warning_batch(database_, snapshot_id, batch_limit);
+        failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+        transaction.commit();
+        if (removed == 0) {
+            break;
+        }
+    }
+
+    Transaction final_transaction(database_);
+    auto remove = database_.statement(
+        "DELETE FROM snapshots WHERE id = :snapshot_id AND status = 'deleting' RETURNING id");
+    remove.bind(":snapshot_id", snapshot_id);
+    if (!remove.step()) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "finishing deletion requires a deleting snapshot");
+    }
+    (void)remove.column_int64(0);
+    if (remove.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "finishing deletion removed multiple snapshots");
+    }
+    failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+    final_transaction.commit();
+}
+
+std::vector<IncompleteSnapshotInfo> MetadataStore::list_incomplete_snapshots() const {
+    auto query = database_.statement(
+        "SELECT id, status FROM snapshots WHERE status <> 'complete' ORDER BY id");
+    std::vector<IncompleteSnapshotInfo> snapshots;
+    while (query.step()) {
+        snapshots.push_back(
+            {query.column_int64(0), snapshot_status_from_storage(query.column_text(1))});
+    }
+    return snapshots;
+}
+
+void MetadataStore::mark_stale_pending_snapshot_failed(SnapshotId snapshot_id,
+                                                       std::string_view failure_message,
+                                                       std::int64_t completed_at_ns,
+                                                       FailureInjector& failure_injector) const {
+    Transaction transaction(database_);
+    auto update = database_.statement(
+        "UPDATE snapshots SET completed_at_ns = :completed_at_ns, status = 'failed', "
+        "failure_message = :failure_message "
+        "WHERE id = :snapshot_id AND status = 'pending' RETURNING id");
+    update.bind(":completed_at_ns", completed_at_ns);
+    update.bind(":failure_message", failure_message);
+    update.bind(":snapshot_id", snapshot_id);
+    if (!update.step()) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "recovery requires a stale pending snapshot");
+    }
+    (void)update.column_int64(0);
+    if (update.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "recovery failed multiple pending snapshots");
+    }
+    failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+    transaction.commit();
+}
+
+void MetadataStore::clean_incomplete_snapshot(SnapshotId snapshot_id,
+                                              FailureInjector& failure_injector,
+                                              std::size_t entry_batch_limit) const {
+    const std::int64_t batch_limit = checked_batch_limit(entry_batch_limit);
+    for (;;) {
+        Transaction transaction(database_);
+        auto status = database_.statement("SELECT 1 FROM snapshots WHERE id = :snapshot_id "
+                                          "AND status IN ('failed', 'cancelled')");
+        status.bind(":snapshot_id", snapshot_id);
+        if (!status.step()) {
+            throw LocalVaultError(ErrorCode::invalid_argument,
+                                  "cleanup requires a failed or cancelled snapshot");
+        }
+        if (status.step()) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "incomplete snapshot identifier selected multiple rows");
+        }
+
+        const std::size_t removed = delete_entry_batch(database_, snapshot_id, batch_limit);
+        failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+        transaction.commit();
+        if (removed == 0) {
+            break;
+        }
+    }
+
+    for (;;) {
+        Transaction transaction(database_);
+        auto status = database_.statement("SELECT 1 FROM snapshots WHERE id = :snapshot_id "
+                                          "AND status IN ('failed', 'cancelled')");
+        status.bind(":snapshot_id", snapshot_id);
+        if (!status.step()) {
+            throw LocalVaultError(ErrorCode::invalid_argument,
+                                  "cleanup requires a failed or cancelled snapshot");
+        }
+        if (status.step()) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "incomplete snapshot identifier selected multiple rows");
+        }
+
+        const std::size_t removed = delete_warning_batch(database_, snapshot_id, batch_limit);
+        failure_injector.hit(FailurePoint::before_metadata_batch_commit);
+        transaction.commit();
+        if (removed == 0) {
+            break;
+        }
+    }
+}
+
+void MetadataStore::quick_relationship_check() const {
+    auto foreign_keys = database_.statement("PRAGMA foreign_key_check");
+    if (foreign_keys.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "repository metadata contains a foreign-key violation");
+    }
+
+    auto invalid = database_.statement(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM snapshots WHERE status IN ('pending', 'deleting') "
+        "UNION ALL "
+        "SELECT 1 FROM entries AS e JOIN snapshots AS s ON s.id = e.snapshot_id "
+        "WHERE s.status IN ('failed', 'cancelled') "
+        "UNION ALL "
+        "SELECT 1 FROM snapshot_warnings AS w JOIN snapshots AS s ON s.id = w.snapshot_id "
+        "WHERE s.status IN ('failed', 'cancelled') "
+        "UNION ALL "
+        "SELECT 1 FROM entries AS e JOIN snapshots AS s ON s.id = e.snapshot_id "
+        "WHERE s.status = 'complete' AND e.entry_type = 'file' "
+        "AND (e.file_hash IS NULL OR length(e.file_hash) <> 64 "
+        "OR e.file_hash GLOB '*[^0-9a-f]*')"
+        ")");
+    if (!invalid.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "repository relationship check returned no row");
+    }
+    const bool has_invalid_relationship = invalid.column_int64(0) != 0;
+    if (invalid.step()) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "repository relationship check returned multiple rows");
+    }
+    if (has_invalid_relationship) {
+        throw LocalVaultError(ErrorCode::database_error,
+                              "repository metadata failed the quick relationship check");
+    }
 }
 
 std::int64_t MetadataStore::insert_entry(SnapshotId snapshot_id, const ScannedEntry& entry) const {
@@ -398,6 +695,9 @@ void MetadataStore::insert_warning(SnapshotId snapshot_id, std::string_view rela
 std::vector<EntryInfo> MetadataStore::list_entries(SnapshotId snapshot_id) const {
     auto query = database_.statement("SELECT " + std::string(entry_projection) +
                                      " FROM entries WHERE snapshot_id = :snapshot_id "
+                                     "AND EXISTS (SELECT 1 FROM snapshots "
+                                     "WHERE snapshots.id = entries.snapshot_id "
+                                     "AND snapshots.status = 'complete') "
                                      "ORDER BY relative_path");
     query.bind(":snapshot_id", snapshot_id);
     return read_entries(std::move(query));
@@ -408,7 +708,9 @@ std::vector<EntryInfo> MetadataStore::list_children(SnapshotId snapshot_id,
     auto query = database_.statement(
         "SELECT " + std::string(entry_projection) +
         " FROM entries WHERE snapshot_id = :snapshot_id AND parent_path = :parent_path "
-        "AND relative_path <> '' ORDER BY name, relative_path");
+        "AND relative_path <> '' AND EXISTS (SELECT 1 FROM snapshots "
+        "WHERE snapshots.id = entries.snapshot_id AND snapshots.status = 'complete') "
+        "ORDER BY name, relative_path");
     query.bind(":snapshot_id", snapshot_id);
     query.bind(":parent_path", parent_path);
     return read_entries(std::move(query));
@@ -418,7 +720,10 @@ std::vector<ChunkReferenceInfo> MetadataStore::list_entry_chunks(std::int64_t en
     auto query = database_.statement(
         "SELECT ec.sequence_number, ec.chunk_hash, c.object_path, ec.raw_offset, ec.raw_length, "
         "c.raw_size, c.compressed_size FROM entry_chunks AS ec "
-        "JOIN chunks AS c ON c.hash = ec.chunk_hash WHERE ec.entry_id = :entry_id "
+        "JOIN chunks AS c ON c.hash = ec.chunk_hash "
+        "JOIN entries AS e ON e.id = ec.entry_id "
+        "JOIN snapshots AS s ON s.id = e.snapshot_id "
+        "WHERE ec.entry_id = :entry_id AND s.status = 'complete' "
         "ORDER BY ec.sequence_number");
     query.bind(":entry_id", entry_id);
     std::vector<ChunkReferenceInfo> chunks;

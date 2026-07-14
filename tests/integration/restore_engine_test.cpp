@@ -7,8 +7,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,6 +38,15 @@
 
 namespace localvault {
 namespace {
+
+class ThrowDuringRestoreInjector final : public FailureInjector {
+  public:
+    void hit(FailurePoint point) override {
+        if (point == FailurePoint::during_restore_write) {
+            throw std::runtime_error("injected restore write failure");
+        }
+    }
+};
 
 [[nodiscard]] std::string read_text(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -178,6 +189,30 @@ TEST_F(RestoreEngineTest, NativeNoReplacePublicationPreservesDestinationAndTempo
     EXPECT_EQ(temporary.publish(destination, false), RestorePublishResult::destination_exists);
     EXPECT_EQ(read_text(destination), "existing");
     EXPECT_EQ(read_text(temporary_path), "replacement");
+}
+
+TEST_F(RestoreEngineTest, FailureAfterRestoreWriteCannotPublishOverDestination) {
+    const std::filesystem::path source = temporary_.path() / "source";
+    test::DatasetBuilder(source).text_file("file.txt", "snapshot bytes");
+    const SnapshotId snapshot_id = snapshot(source);
+    const std::filesystem::path destination = destination_path("injected-restore");
+    test::DatasetBuilder(destination).text_file("file.txt", "existing bytes");
+    repository_->set_failure_injector(std::make_shared<ThrowDuringRestoreInjector>());
+
+    EXPECT_THROW((void)RestoreEngine(*repository_)
+                     .restore({
+                         .snapshot_id = snapshot_id,
+                         .relative_paths = {},
+                         .destination_root = destination,
+                         .overwrite_policy = OverwritePolicy::always,
+                         .conflict_resolver = {},
+                     }),
+                 std::runtime_error);
+
+    EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
+    EXPECT_EQ(std::ranges::distance(std::filesystem::directory_iterator(destination),
+                                    std::filesystem::directory_iterator{}),
+              1);
 }
 
 TEST_F(RestoreEngineTest, RestoresOneFileOrOneDirectoryRecursively) {

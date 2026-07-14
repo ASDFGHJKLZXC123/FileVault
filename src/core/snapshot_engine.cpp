@@ -5,10 +5,12 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 
 #include "database/metadata_store.hpp"
+#include "database/transaction.hpp"
 #include "filesystem/file_scanner.hpp"
 #include "filesystem/platform/path_safety.hpp"
 #include "filesystem/platform/platform_lock.hpp"
@@ -127,14 +129,18 @@ void report_progress(const ProgressCallback& callback, OperationPhase phase,
     });
 }
 
-void mark_failed_best_effort(const MetadataStore& metadata, SnapshotId snapshot_id,
-                             std::string_view message) noexcept {
+void mark_incomplete_best_effort(const MetadataStore& metadata, SnapshotId snapshot_id,
+                                 SnapshotStatus status, std::string_view message,
+                                 FailureInjector& failure_injector,
+                                 std::size_t metadata_batch_limit) noexcept {
     try {
-        metadata.mark_snapshot_failed(snapshot_id, message, now_ns());
+        metadata.mark_snapshot_incomplete(snapshot_id, status, message, now_ns());
+        metadata.clean_incomplete_snapshot(snapshot_id, failure_injector, metadata_batch_limit);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "LocalVault: marking snapshot failed also failed: %s\n", error.what());
+        std::fprintf(stderr, "LocalVault: cleaning incomplete snapshot also failed: %s\n",
+                     error.what());
     } catch (...) {
-        std::fprintf(stderr, "LocalVault: marking snapshot failed also failed\n");
+        std::fprintf(stderr, "LocalVault: cleaning incomplete snapshot also failed\n");
     }
 }
 
@@ -165,10 +171,12 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
     report_progress(progress, OperationPhase::preparing, source, totals);
     RepositoryLock writer_lock =
         RepositoryLock::acquire_exclusive(repository_.root() / "repository.lock");
+    repository_.recover_after_writer_lock();
     MetadataStore metadata(repository_.database());
     const std::int64_t started_at_ns = now_ns();
     const SnapshotId snapshot_id =
         metadata.create_pending_snapshot(path_to_utf8(source), options.message, started_at_ns);
+    const std::shared_ptr<FailureInjector> failure_injector = repository_.failure_injector();
 
     SnapshotResult result;
     result.snapshot_id = snapshot_id;
@@ -178,18 +186,34 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
         check_cancelled(stop_token, source);
         const ScanResult scan = FileScanner{}.scan(source);
         check_cancelled(stop_token, source);
-        for (const ScanWarning& warning : scan.warnings) {
+        auto metadata_batch = std::make_unique<Transaction>(repository_.database());
+        std::size_t batch_record_count = 0;
+        ByteCount batch_logical_bytes = 0;
+        const auto commit_batch = [&] {
+            failure_injector->hit(FailurePoint::before_metadata_batch_commit);
+            metadata_batch->commit();
+        };
+        for (std::size_t index = 0; index < scan.warnings.size(); ++index) {
+            const ScanWarning& warning = scan.warnings[index];
             metadata.insert_warning(snapshot_id, warning.relative_path, warning.code,
                                     warning.message);
             result.skipped_entries.push_back(
                 {path_from_utf8(warning.relative_path), warning.message});
+            ++batch_record_count;
+            if (batch_record_count >= metadata_batch_entry_limit_ &&
+                (index + 1U < scan.warnings.size() || !scan.entries.empty())) {
+                commit_batch();
+                metadata_batch = std::make_unique<Transaction>(repository_.database());
+                batch_record_count = 0;
+            }
         }
 
         Chunker chunker(repository_.info().chunk_size_bytes);
         ObjectStore objects(repository_.root(), metadata, repository_.info().chunk_size_bytes,
-                            repository_.info().zstd_level);
+                            repository_.info().zstd_level, failure_injector);
         const std::uint64_t discovered_entries = scan.entries.size();
-        for (const ScannedEntry& entry : scan.entries) {
+        for (std::size_t index = 0; index < scan.entries.size(); ++index) {
+            const ScannedEntry& entry = scan.entries[index];
             check_cancelled(stop_token, entry.source_path);
             report_progress(progress, OperationPhase::writing_metadata, entry.source_path, totals,
                             discovered_entries);
@@ -236,22 +260,47 @@ SnapshotResult SnapshotEngine::create_snapshot(const std::filesystem::path& sour
                 break;
             }
             }
+
+            // A regular entry is the atomic unit: its chunk references and full-file hash stay in
+            // the same transaction even when one large file crosses the byte threshold.
+            ++batch_record_count;
+            add_bytes(batch_logical_bytes, entry.logical_size, "metadata batch logical size");
+            const bool limit_reached = batch_record_count >= metadata_batch_entry_limit_ ||
+                                       batch_logical_bytes >= metadata_batch_logical_byte_limit_;
+            if (limit_reached && index + 1U < scan.entries.size()) {
+                commit_batch();
+                metadata_batch = std::make_unique<Transaction>(repository_.database());
+                batch_record_count = 0;
+                batch_logical_bytes = 0;
+            }
         }
+        commit_batch();
+        metadata_batch.reset();
 
         check_cancelled(stop_token, source);
         const auto elapsed = std::chrono::nanoseconds(now_ns() - started_at_ns);
         totals.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
         report_progress(progress, OperationPhase::finalizing, source, totals, discovered_entries);
+        Transaction publication(repository_.database());
+        failure_injector->hit(FailurePoint::before_snapshot_publish);
         metadata.mark_snapshot_complete(snapshot_id, totals, now_ns());
+        publication.commit();
     } catch (const LocalVaultError& error) {
-        mark_failed_best_effort(metadata, snapshot_id, error.what());
+        const SnapshotStatus status = error.code() == ErrorCode::cancelled
+                                          ? SnapshotStatus::cancelled
+                                          : SnapshotStatus::failed;
+        mark_incomplete_best_effort(metadata, snapshot_id, status, error.what(), *failure_injector,
+                                    metadata_batch_entry_limit_);
         throw;
     } catch (const std::exception& error) {
-        mark_failed_best_effort(metadata, snapshot_id, error.what());
+        mark_incomplete_best_effort(metadata, snapshot_id, SnapshotStatus::failed, error.what(),
+                                    *failure_injector, metadata_batch_entry_limit_);
         throw LocalVaultError(ErrorCode::internal_error,
                               "snapshot failed: " + std::string(error.what()), source);
     } catch (...) {
-        mark_failed_best_effort(metadata, snapshot_id, "unknown snapshot failure");
+        mark_incomplete_best_effort(metadata, snapshot_id, SnapshotStatus::failed,
+                                    "unknown snapshot failure", *failure_injector,
+                                    metadata_batch_entry_limit_);
         throw;
     }
 

@@ -169,6 +169,44 @@ bool repository_storage_is_proven_read_only(const std::filesystem::path& root) n
            (filesystem_information.f_flag & ST_RDONLY) != 0U;
 }
 
+bool platform_is_sharing_violation(const std::error_code&) noexcept {
+    return false;
+}
+
+void sync_existing_regular_file(const std::filesystem::path& path) {
+    const int descriptor = ::open(path.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (descriptor == -1) {
+        throw_filesystem_error(path, "failed to open existing object for flushing", errno);
+    }
+
+    struct stat information{};
+    if (::fstat(descriptor, &information) != 0) {
+        const int error_number = errno;
+        (void)::close(descriptor);
+        throw_filesystem_error(path, "failed to inspect existing object for flushing",
+                               error_number);
+    }
+    if (!S_ISREG(information.st_mode)) {
+        (void)::close(descriptor);
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "existing object to flush is not a regular file", path);
+    }
+
+#if defined(__APPLE__)
+    const int result = ::fcntl(descriptor, F_FULLFSYNC);
+#else
+    const int result = ::fsync(descriptor);
+#endif
+    if (result != 0) {
+        const int error_number = errno;
+        (void)::close(descriptor);
+        throw_filesystem_error(path, "failed to flush existing object", error_number);
+    }
+    if (::close(descriptor) != 0) {
+        throw_filesystem_error(path, "failed to close flushed existing object", errno);
+    }
+}
+
 void flush_containing_directory(const std::filesystem::path& path) {
     const std::filesystem::path directory = path.parent_path();
     const int descriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

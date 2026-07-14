@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "database/database.hpp"
+#include "database/metadata_store.hpp"
 #include "database/migrations.hpp"
 #include "database/statement.hpp"
 #include "database/transaction.hpp"
@@ -29,6 +30,17 @@
 
 namespace localvault {
 namespace {
+
+class NoopFailureInjector final : public FailureInjector {
+  public:
+    void hit(FailurePoint) override {}
+};
+
+[[nodiscard]] const std::shared_ptr<FailureInjector>& noop_failure_injector() {
+    static const std::shared_ptr<FailureInjector> injector =
+        std::make_shared<NoopFailureInjector>();
+    return injector;
+}
 
 constexpr std::uint64_t kMaximumRepositoryChunkSize = 4ULL * 1024ULL * 1024ULL;
 
@@ -363,6 +375,100 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
     apply_restrictive_file_permissions(ledger[index].path);
 }
 
+[[nodiscard]] bool remove_recovery_path(const std::filesystem::path& path) {
+    std::error_code error;
+    (void)std::filesystem::remove_all(path, error);
+    if (!error) {
+        return true;
+    }
+    if (platform_is_sharing_violation(error)) {
+        std::fprintf(stderr, "LocalVault: a temporary path is still shared; recovery will retry\n");
+        return false;
+    }
+    throw LocalVaultError(ErrorCode::filesystem_error,
+                          "failed to remove temporary recovery path: " + error.message(), path);
+}
+
+[[nodiscard]] bool clear_directory_contents(const std::filesystem::path& directory) {
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(directory, error);
+    if (error) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect temporary recovery directory: " + error.message(),
+                              directory);
+    }
+
+    bool complete = true;
+    const std::filesystem::directory_iterator end;
+    while (iterator != end) {
+        const std::filesystem::path path = iterator->path();
+        complete = remove_recovery_path(path) && complete;
+        iterator.increment(error);
+        if (error) {
+            throw LocalVaultError(ErrorCode::filesystem_error,
+                                  "failed to continue inspecting temporary recovery directory: " +
+                                      error.message(),
+                                  directory);
+        }
+    }
+    return complete;
+}
+
+void require_recovery_directory(const std::filesystem::path& directory) {
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(directory, error);
+    if (error == std::errc::no_such_file_or_directory ||
+        status.type() == std::filesystem::file_type::not_found) {
+        error.clear();
+        if (!std::filesystem::create_directory(directory, error) || error) {
+            throw LocalVaultError(ErrorCode::filesystem_error,
+                                  "failed to recreate temporary recovery directory: " +
+                                      (error ? error.message() : std::string("path exists")),
+                                  directory);
+        }
+        return;
+    }
+    if (error || !std::filesystem::is_directory(status) || std::filesystem::is_symlink(status)) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "temporary recovery path is not a real directory", directory);
+    }
+}
+
+[[nodiscard]] bool clear_temporary_tree(const std::filesystem::path& repository_root) {
+    const std::filesystem::path temporary = repository_root / "temporary";
+    const std::filesystem::path temporary_objects = temporary / "objects";
+    const std::filesystem::path temporary_restores = temporary / "restores";
+
+    bool complete = true;
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(temporary, error);
+    if (error) {
+        throw LocalVaultError(
+            ErrorCode::filesystem_error,
+            "failed to inspect repository temporary directory: " + error.message(), temporary);
+    }
+    const std::filesystem::directory_iterator end;
+    while (iterator != end) {
+        const std::filesystem::path path = iterator->path();
+        if (path == temporary_objects || path == temporary_restores) {
+            require_recovery_directory(path);
+            complete = clear_directory_contents(path) && complete;
+        } else {
+            complete = remove_recovery_path(path) && complete;
+        }
+        iterator.increment(error);
+        if (error) {
+            throw LocalVaultError(ErrorCode::filesystem_error,
+                                  "failed to continue inspecting repository temporary directory: " +
+                                      error.message(),
+                                  temporary);
+        }
+    }
+    require_recovery_directory(temporary_objects);
+    require_recovery_directory(temporary_restores);
+    return complete;
+}
+
 } // namespace
 
 class Repository::Impl final {
@@ -370,13 +476,15 @@ class Repository::Impl final {
     Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database> database,
          OpenMode mode)
         : root_(std::move(root)), info_(std::move(info)), database_(std::move(database)),
-          mode_(mode) {}
+          mode_(mode), failure_injector_(noop_failure_injector()) {}
 
     std::filesystem::path root_;
     RepositoryInfo info_;
     std::unique_ptr<Database> database_;
     OpenMode mode_;
     std::shared_ptr<FailureInjector> failure_injector_;
+    std::size_t recovery_entry_batch_limit_{10'000};
+    bool recovery_complete_{false};
 };
 
 void Repository::create(const std::filesystem::path& requested_root,
@@ -631,8 +739,59 @@ OpenMode Repository::open_mode() const noexcept {
     return impl_->mode_;
 }
 
+std::shared_ptr<FailureInjector> Repository::failure_injector() const noexcept {
+    return impl_->failure_injector_;
+}
+
+void Repository::recover_after_writer_lock() {
+    if (impl_->recovery_complete_) {
+        return;
+    }
+    if (impl_->mode_ != OpenMode::read_write) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "recovery requires a read-write repository", impl_->root_);
+    }
+
+    MetadataStore metadata(*impl_->database_);
+    for (const IncompleteSnapshotInfo& snapshot : metadata.list_incomplete_snapshots()) {
+        switch (snapshot.status) {
+        case SnapshotStatus::pending:
+            metadata.mark_stale_pending_snapshot_failed(
+                snapshot.id, "snapshot operation was interrupted before publication", utc_now_ns(),
+                *impl_->failure_injector_);
+            metadata.clean_incomplete_snapshot(snapshot.id, *impl_->failure_injector_,
+                                               impl_->recovery_entry_batch_limit_);
+            break;
+        case SnapshotStatus::failed:
+        case SnapshotStatus::cancelled:
+            metadata.clean_incomplete_snapshot(snapshot.id, *impl_->failure_injector_,
+                                               impl_->recovery_entry_batch_limit_);
+            break;
+        case SnapshotStatus::deleting:
+            metadata.delete_deleting_snapshot(snapshot.id, *impl_->failure_injector_,
+                                              impl_->recovery_entry_batch_limit_);
+            break;
+        case SnapshotStatus::complete:
+            throw LocalVaultError(ErrorCode::internal_error,
+                                  "recovery selected an already complete snapshot");
+        }
+    }
+
+    const bool temporary_cleanup_complete = clear_temporary_tree(impl_->root_);
+    metadata.quick_relationship_check();
+    impl_->recovery_complete_ = temporary_cleanup_complete;
+}
+
+void Repository::set_recovery_entry_batch_limit_for_testing(std::size_t entry_batch_limit) {
+    if (entry_batch_limit == 0) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "recovery entry batch limit must not be zero");
+    }
+    impl_->recovery_entry_batch_limit_ = entry_batch_limit;
+}
+
 void Repository::set_failure_injector(std::shared_ptr<FailureInjector> injector) {
-    impl_->failure_injector_ = std::move(injector);
+    impl_->failure_injector_ = injector ? std::move(injector) : noop_failure_injector();
 }
 
 } // namespace localvault

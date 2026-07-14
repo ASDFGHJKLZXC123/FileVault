@@ -4,11 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "database/database.hpp"
@@ -17,6 +20,8 @@
 #include "database/statement.hpp"
 #include "filesystem/platform/file_metadata.hpp"
 #include "localvault/error.hpp"
+#include "localvault/failure_injector.hpp"
+#include "storage/blake3_hasher.hpp"
 #include "storage/object_store.hpp"
 #include "support/test_filesystem.hpp"
 
@@ -24,6 +29,32 @@ namespace localvault {
 namespace {
 
 constexpr ByteCount test_chunk_limit = 512ULL * 1024ULL;
+
+class NoopFailureInjector final : public FailureInjector {
+  public:
+    void hit(FailurePoint) override {}
+};
+
+class ThrowingFailureInjector final : public FailureInjector {
+  public:
+    explicit ThrowingFailureInjector(FailurePoint target) : target_(target) {}
+
+    void hit(FailurePoint point) override {
+        hits.push_back(point);
+        if (point == target_) {
+            throw std::runtime_error("injected object publication failure");
+        }
+    }
+
+    std::vector<FailurePoint> hits;
+
+  private:
+    FailurePoint target_;
+};
+
+[[nodiscard]] std::shared_ptr<FailureInjector> noop_failure_injector() {
+    return std::make_shared<NoopFailureInjector>();
+}
 
 template <typename Function> void expect_error_code(Function&& function, ErrorCode expected) {
     try {
@@ -38,7 +69,7 @@ class ObjectStoreFixture : public ::testing::Test {
   protected:
     ObjectStoreFixture()
         : database_(temporary_.path() / "repository.db"), metadata_(database_),
-          objects_(temporary_.path(), metadata_, test_chunk_limit, 3) {
+          objects_(temporary_.path(), metadata_, test_chunk_limit, 3, noop_failure_injector()) {
         run_migrations(database_);
     }
 
@@ -100,7 +131,8 @@ TEST_F(ObjectStoreFixture, MapsStrictHashStoresOneZstdFrameAndReusesMetadata) {
 
     const StoredObject cache_reuse = objects_.store(abc);
     EXPECT_FALSE(cache_reuse.newly_stored);
-    ObjectStore cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3);
+    ObjectStore cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3,
+                           noop_failure_injector());
     EXPECT_FALSE(cold_cache.store(abc).newly_stored);
     EXPECT_TRUE(std::filesystem::is_empty(temporary_.path() / "temporary" / "objects"));
 
@@ -116,7 +148,8 @@ TEST_F(ObjectStoreFixture, MapsStrictHashStoresOneZstdFrameAndReusesMetadata) {
 
     database_.execute("ALTER TABLE chunks RENAME TO chunks_unavailable");
     EXPECT_FALSE(objects_.store(abc).newly_stored);
-    ObjectStore unavailable_cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3);
+    ObjectStore unavailable_cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3,
+                                       noop_failure_injector());
     expect_error_code([&] { (void)unavailable_cold_cache.store(abc); }, ErrorCode::database_error);
 }
 
@@ -212,7 +245,8 @@ TEST_F(ObjectStoreFixture, ReadRejectsInvalidMissingWrongSizedCorruptAndMultiple
 TEST_F(ObjectStoreFixture, ColdCacheChecksAuthoritativeRowAndRegularFinalFile) {
     constexpr std::array<std::byte, 4> raw{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
     const StoredObject stored = objects_.store(raw);
-    ObjectStore cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3);
+    ObjectStore cold_cache(temporary_.path(), metadata_, test_chunk_limit, 3,
+                           noop_failure_injector());
 
     update_chunk(stored.hash_hex, "raw_size", 3);
     expect_error_code([&] { (void)cold_cache.store(raw); }, ErrorCode::object_corrupt);
@@ -288,6 +322,97 @@ TEST_F(ObjectStoreFixture, AtomicNoReplaceDuplicateOutcomePreservesImmutableFina
     }
     EXPECT_FALSE(std::filesystem::exists(duplicate_path));
     EXPECT_FALSE(objects_.store(raw).newly_stored);
+}
+
+TEST_F(ObjectStoreFixture, RepositoryTemporaryObjectIsUniqueAndCleanedWithoutPublication) {
+    static_assert(std::is_nothrow_destructible_v<TemporaryOutputFile>);
+
+    constexpr std::string_view hash =
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+    const std::filesystem::path repository_root = temporary_.path();
+    const std::filesystem::path temporary_directory = repository_root / "temporary" / "objects";
+    const std::filesystem::path final_path =
+        repository_root / ObjectStore::object_relative_path(hash);
+    std::filesystem::create_directories(temporary_directory);
+    std::filesystem::create_directories(final_path.parent_path());
+
+    std::filesystem::path first_temporary_path;
+    std::filesystem::path second_temporary_path;
+    {
+        TemporaryOutputFile first(temporary_directory);
+        TemporaryOutputFile second(temporary_directory);
+        first_temporary_path = first.path();
+        second_temporary_path = second.path();
+        EXPECT_NE(first_temporary_path, second_temporary_path);
+        EXPECT_EQ(first_temporary_path.parent_path(), temporary_directory);
+        EXPECT_EQ(first_temporary_path.lexically_relative(repository_root).parent_path(),
+                  std::filesystem::path("temporary") / "objects");
+        EXPECT_EQ(final_path.lexically_relative(repository_root).parent_path(),
+                  std::filesystem::path("objects") / "64");
+        EXPECT_NE(first_temporary_path.filename(), final_path.filename());
+        EXPECT_TRUE(std::filesystem::is_regular_file(first_temporary_path));
+        EXPECT_TRUE(std::filesystem::is_regular_file(second_temporary_path));
+    }
+
+    EXPECT_FALSE(std::filesystem::exists(first_temporary_path));
+    EXPECT_FALSE(std::filesystem::exists(second_temporary_path));
+    EXPECT_FALSE(std::filesystem::exists(final_path));
+}
+
+TEST_F(ObjectStoreFixture, FailurePointsBracketObjectPublicationBeforeMetadata) {
+    constexpr std::array points{
+        FailurePoint::after_temp_object_write,
+        FailurePoint::after_object_fsync,
+        FailurePoint::after_object_rename,
+    };
+
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const std::vector<std::byte> raw{std::byte{0x40}, static_cast<std::byte>(index + 1U)};
+        Blake3Hasher hasher;
+        hasher.update(raw);
+        const std::string hash = Blake3Hasher::to_hex(hasher.finalize());
+        const std::filesystem::path final_path =
+            temporary_.path() / ObjectStore::object_relative_path(hash);
+        const auto injector = std::make_shared<ThrowingFailureInjector>(points[index]);
+        ObjectStore objects(temporary_.path(), metadata_, test_chunk_limit, 3, injector);
+
+        EXPECT_THROW((void)objects.store(raw), std::runtime_error);
+        ASSERT_EQ(injector->hits.size(), index + 1U);
+        EXPECT_TRUE(std::ranges::equal(injector->hits, std::span(points).first(index + 1U)));
+        EXPECT_TRUE(std::filesystem::is_directory(final_path.parent_path()));
+        EXPECT_EQ(std::filesystem::exists(final_path),
+                  points[index] == FailurePoint::after_object_rename);
+        EXPECT_FALSE(metadata_.find_chunk(hash).has_value());
+        EXPECT_TRUE(std::filesystem::is_empty(temporary_.path() / "temporary" / "objects"));
+    }
+}
+
+TEST_F(ObjectStoreFixture, RenameFailureLeavesVerifiableOrphanThatColdStoreAdopts) {
+    constexpr std::array<std::byte, 4> raw{std::byte{0x51}, std::byte{0x52}, std::byte{0x53},
+                                           std::byte{0x54}};
+    Blake3Hasher hasher;
+    hasher.update(raw);
+    const std::string hash = Blake3Hasher::to_hex(hasher.finalize());
+    const std::filesystem::path final_path =
+        temporary_.path() / ObjectStore::object_relative_path(hash);
+
+    ObjectStore interrupted(
+        temporary_.path(), metadata_, test_chunk_limit, 3,
+        std::make_shared<ThrowingFailureInjector>(FailurePoint::after_object_rename));
+    EXPECT_THROW((void)interrupted.store(raw), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::is_regular_file(final_path));
+    EXPECT_FALSE(metadata_.find_chunk(hash).has_value());
+    EXPECT_TRUE(std::filesystem::is_empty(temporary_.path() / "temporary" / "objects"));
+
+    ObjectStore reopened(temporary_.path(), metadata_, test_chunk_limit, 3,
+                         noop_failure_injector());
+    const StoredObject adopted = reopened.store(raw);
+    EXPECT_FALSE(adopted.newly_stored);
+    EXPECT_EQ(adopted.relative_path, ObjectStore::object_relative_path(hash));
+    EXPECT_TRUE(metadata_.find_chunk(hash).has_value());
+    EXPECT_EQ(reopened.read_verified(adopted.hash_hex, adopted.relative_path, adopted.raw_size,
+                                     adopted.stored_size),
+              (std::vector<std::byte>(raw.begin(), raw.end())));
 }
 
 TEST_F(ObjectStoreFixture, AcceptsIncompressibleFrameEvenWhenItGrows) {

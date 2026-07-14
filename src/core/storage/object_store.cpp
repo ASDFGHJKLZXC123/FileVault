@@ -15,6 +15,7 @@
 #include "filesystem/platform/file_metadata.hpp"
 #include "filesystem/platform/repository_support.hpp"
 #include "localvault/error.hpp"
+#include "localvault/failure_injector.hpp"
 #include "storage/blake3_hasher.hpp"
 
 namespace localvault {
@@ -134,16 +135,23 @@ void ensure_directory(const std::filesystem::path& path) {
 } // namespace
 
 ObjectStore::ObjectStore(std::filesystem::path repository_root, MetadataStore& metadata,
-                         ByteCount maximum_chunk_size, int compression_level)
-    : ObjectStore(std::move(repository_root), maximum_chunk_size, compression_level) {
+                         ByteCount maximum_chunk_size, int compression_level,
+                         std::shared_ptr<FailureInjector> failure_injector)
+    : ObjectStore(std::move(repository_root), maximum_chunk_size, compression_level,
+                  std::move(failure_injector)) {
     metadata_ = &metadata;
 }
 
 ObjectStore::ObjectStore(std::filesystem::path repository_root, ByteCount maximum_chunk_size,
-                         int compression_level)
-    : repository_root_(std::move(repository_root)),
+                         int compression_level, std::shared_ptr<FailureInjector> failure_injector)
+    : repository_root_(std::move(repository_root)), failure_injector_(std::move(failure_injector)),
       maximum_chunk_size_(checked_maximum_chunk_size(maximum_chunk_size)),
-      codec_(compression_level) {}
+      codec_(compression_level) {
+    if (!failure_injector_) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "object storage requires a failure injector");
+    }
+}
 
 std::filesystem::path ObjectStore::object_relative_path(std::string_view hash_hex) {
     require_valid_hash(hash_hex, ErrorCode::invalid_argument);
@@ -208,6 +216,8 @@ std::optional<StoredObject> ObjectStore::find_existing(std::string_view hash_hex
         return std::nullopt;
     }
     (void)read_verified(hash_hex, relative_path, raw_size, *orphan_size);
+    sync_existing_regular_file(final_path);
+    flush_containing_directory(final_path);
     metadata_->ensure_chunk({
         .hash_hex = std::string(hash_hex),
         .raw_size = raw_size,
@@ -251,12 +261,17 @@ StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
 
     const std::filesystem::path final_path = repository_root_ / relative_path;
     ensure_directory(final_path.parent_path());
+    // Repeat this durability barrier even when the shard already exists. If a prior attempt
+    // created the shard but failed while syncing objects/, its retry must not skip that sync.
+    flush_containing_directory(final_path.parent_path());
     const std::filesystem::path temporary_directory = repository_root_ / "temporary" / "objects";
     ensure_directory(temporary_directory);
 
     TemporaryOutputFile temporary(temporary_directory);
     temporary.write(compressed);
+    failure_injector_->hit(FailurePoint::after_temp_object_write);
     temporary.sync();
+    failure_injector_->hit(FailurePoint::after_object_fsync);
     if (std::optional<StoredObject> existing = find_existing(hash_hex, relative_path, raw_size)) {
         return std::move(*existing);
     }
@@ -270,6 +285,7 @@ StoredObject ObjectStore::store(std::span<const std::byte> raw_bytes) {
         return std::move(*existing);
     }
 
+    failure_injector_->hit(FailurePoint::after_object_rename);
     flush_containing_directory(final_path);
     metadata_->ensure_chunk({
         .hash_hex = hash_hex,

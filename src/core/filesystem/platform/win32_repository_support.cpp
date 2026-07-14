@@ -85,6 +85,53 @@ bool repository_storage_is_proven_read_only(const std::filesystem::path& root) n
     return (flags & FILE_READ_ONLY_VOLUME) != 0;
 }
 
+bool platform_is_sharing_violation(const std::error_code& error) noexcept {
+    return error.value() == static_cast<int>(ERROR_SHARING_VIOLATION);
+}
+
+void sync_existing_regular_file(const std::filesystem::path& path) {
+    const HANDLE handle =
+        ::CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to open existing object for flushing (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (::GetFileInformationByHandle(handle, &information) == 0) {
+        const DWORD error = ::GetLastError();
+        (void)::CloseHandle(handle);
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to inspect existing object for flushing (Windows error " +
+                                  std::to_string(error) + ")",
+                              path);
+    }
+    if (::GetFileType(handle) != FILE_TYPE_DISK ||
+        (information.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0U) {
+        (void)::CloseHandle(handle);
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "existing object to flush is not a regular file", path);
+    }
+    if (::FlushFileBuffers(handle) == 0) {
+        const DWORD error = ::GetLastError();
+        (void)::CloseHandle(handle);
+        throw LocalVaultError(
+            ErrorCode::filesystem_error,
+            "failed to flush existing object (Windows error " + std::to_string(error) + ")", path);
+    }
+    if (::CloseHandle(handle) == 0) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "failed to close flushed existing object (Windows error " +
+                                  std::to_string(::GetLastError()) + ")",
+                              path);
+    }
+}
+
 void flush_containing_directory(const std::filesystem::path&) {
     // SQLite FULL synchronous mode flushes the database. Windows does not offer a
     // generally usable directory fsync equivalent.

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -15,6 +16,7 @@
 namespace localvault {
 
 class MetadataStore;
+class FailureInjector;
 
 struct StoredObject {
     std::string hash_hex;
@@ -29,9 +31,10 @@ class ObjectStore final {
     static constexpr ByteCount permanent_maximum_chunk_size = 4ULL * 1024ULL * 1024ULL;
 
     ObjectStore(std::filesystem::path repository_root, MetadataStore& metadata,
-                ByteCount maximum_chunk_size, int compression_level);
+                ByteCount maximum_chunk_size, int compression_level,
+                std::shared_ptr<FailureInjector> failure_injector);
     ObjectStore(std::filesystem::path repository_root, ByteCount maximum_chunk_size,
-                int compression_level);
+                int compression_level, std::shared_ptr<FailureInjector> failure_injector);
 
     [[nodiscard]] static std::filesystem::path object_relative_path(std::string_view hash_hex);
     [[nodiscard]] StoredObject store(std::span<const std::byte> raw_bytes);
@@ -51,6 +54,7 @@ class ObjectStore final {
 
     std::filesystem::path repository_root_;
     MetadataStore* metadata_{};
+    std::shared_ptr<FailureInjector> failure_injector_;
     std::size_t maximum_chunk_size_{};
     ZstdCodec codec_;
     // M3 is single-threaded. M5 adds synchronization; do not add stripe locks here.

@@ -194,6 +194,28 @@ TEST(Transaction, ExceptionRollsBackAllRows) {
     EXPECT_EQ(scalar_int(database, "SELECT COUNT(*) FROM item"), 0);
 }
 
+TEST(Transaction, RollbackFailureDuringUnwindingPreservesOriginalException) {
+    struct OriginalFailure final {
+        const void* identity;
+    };
+
+    TemporaryDatabase temporary;
+    localvault::Database database(temporary.path());
+    const int identity = 42;
+    bool caught_original = false;
+    try {
+        localvault::Transaction transaction(database);
+        database.execute("ROLLBACK");
+        throw OriginalFailure{&identity};
+    } catch (const OriginalFailure& failure) {
+        caught_original = true;
+        EXPECT_EQ(failure.identity, &identity);
+    } catch (...) {
+        FAIL() << "transaction destructor replaced the propagating exception";
+    }
+    EXPECT_TRUE(caught_original);
+}
+
 TEST(Transaction, CommitPersistsRows) {
     TemporaryDatabase temporary;
     localvault::Database database(temporary.path());

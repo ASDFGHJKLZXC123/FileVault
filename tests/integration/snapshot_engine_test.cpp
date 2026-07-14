@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -24,7 +26,42 @@
 #include "support/test_filesystem.hpp"
 
 namespace localvault {
+
+class SnapshotEngineTestAccess final {
+  public:
+    static void set_metadata_batch_limits(SnapshotEngine& engine, std::size_t entry_limit,
+                                          ByteCount logical_byte_limit) {
+        engine.metadata_batch_entry_limit_ = entry_limit;
+        engine.metadata_batch_logical_byte_limit_ = logical_byte_limit;
+    }
+};
+
 namespace {
+
+class TestFailureInjector final : public FailureInjector {
+  public:
+    TestFailureInjector() = default;
+    explicit TestFailureInjector(FailurePoint throw_at, std::size_t occurrence = 1)
+        : throw_at_(throw_at), throw_occurrence_(occurrence) {}
+
+    void hit(FailurePoint point) override {
+        hits.push_back(point);
+        if (throw_at_.has_value() && point == *throw_at_ &&
+            static_cast<std::size_t>(std::ranges::count(hits, point)) == throw_occurrence_) {
+            throw std::runtime_error("injected snapshot publication failure");
+        }
+    }
+
+    [[nodiscard]] std::size_t count(FailurePoint point) const {
+        return static_cast<std::size_t>(std::ranges::count(hits, point));
+    }
+
+    std::vector<FailurePoint> hits;
+
+  private:
+    std::optional<FailurePoint> throw_at_;
+    std::size_t throw_occurrence_{};
+};
 
 [[nodiscard]] std::string path_utf8(const std::filesystem::path& path) {
     const std::u8string encoded = path.generic_u8string();
@@ -165,8 +202,8 @@ TEST(SnapshotEngineTest, StoresCompleteFixtureWithOrderedVerifiedZstdChunksAndFi
         EXPECT_EQ(path_utf8(*link->symlink_target), "missing target");
     }
 
-    ObjectStore objects(repository_root, create_options.chunk_size_bytes,
-                        create_options.zstd_level);
+    ObjectStore objects(repository_root, create_options.chunk_size_bytes, create_options.zstd_level,
+                        std::make_shared<TestFailureInjector>());
     std::uint64_t total_references = 0;
     bool saw_compressed_size_difference = false;
     for (const EntryInfo& entry : entries) {
@@ -272,12 +309,13 @@ TEST(SnapshotEngineTest, FatalProgressFailureMarksSnapshotFailedAndHidesItFromLi
     ASSERT_TRUE(latest.step());
     const SnapshotId failed_id = latest.column_int64(0);
     EXPECT_EQ(snapshot_status(database, failed_id), "failed");
+    EXPECT_TRUE(metadata.list_entries(failed_id).empty());
     const SnapshotId pending_id = metadata.create_pending_snapshot("/pending", "", std::int64_t{1});
     EXPECT_EQ(snapshot_status(database, pending_id), "pending");
     EXPECT_TRUE(metadata.list_complete_snapshots().empty());
 }
 
-TEST(SnapshotEngineTest, CancellationAfterPendingRowMarksFailureAndThrowsCancelled) {
+TEST(SnapshotEngineTest, CancellationMidSnapshotMarksCancelledAndCleansCommittedMetadata) {
     test::TemporaryDirectory temporary;
     const std::filesystem::path source = temporary.path() / "source";
     const std::filesystem::path repository_root = temporary.path() / "repository";
@@ -285,23 +323,152 @@ TEST(SnapshotEngineTest, CancellationAfterPendingRowMarksFailureAndThrowsCancell
     Repository::create(repository_root);
     Repository repository = Repository::open(repository_root, OpenMode::read_write);
     std::stop_source stop;
+    SnapshotEngine engine(repository);
+    SnapshotEngineTestAccess::set_metadata_batch_limits(engine, 1, 64ULL * 1024ULL * 1024ULL);
 
     try {
-        (void)SnapshotEngine(repository)
-            .create_snapshot(source, {}, stop.get_token(), [&](const ProgressEvent& event) {
-                if (event.phase == OperationPhase::scanning) {
-                    stop.request_stop();
-                }
-            });
+        (void)engine.create_snapshot(source, {}, stop.get_token(), [&](const ProgressEvent& event) {
+            if (event.phase == OperationPhase::writing_metadata) {
+                stop.request_stop();
+            }
+        });
         FAIL() << "cancelled snapshot unexpectedly succeeded";
     } catch (const LocalVaultError& error) {
         EXPECT_EQ(error.code(), ErrorCode::cancelled);
     }
 
     Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    auto latest = database.statement("SELECT id, status FROM snapshots ORDER BY id DESC LIMIT 1");
+    ASSERT_TRUE(latest.step());
+    EXPECT_EQ(latest.column_text(1), "cancelled");
+    const SnapshotId cancelled_id = latest.column_int64(0);
+    EXPECT_TRUE(metadata.list_entries(cancelled_id).empty());
+    auto warnings = database.statement(
+        "SELECT COUNT(*) FROM snapshot_warnings WHERE snapshot_id = :snapshot_id");
+    warnings.bind(":snapshot_id", cancelled_id);
+    ASSERT_TRUE(warnings.step());
+    EXPECT_EQ(warnings.column_int64(0), 0);
+}
+
+TEST(SnapshotEngineTest, TinyBatchOverrideCommitsMultipleBatchesBeforePublishing) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source)
+        .text_file("one", "1")
+        .text_file("two", "2")
+        .text_file("three", "3")
+        .text_file("four", "4")
+        .text_file("five", "5");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    const auto injector = std::make_shared<TestFailureInjector>();
+    repository.set_failure_injector(injector);
+    SnapshotEngine engine(repository);
+    SnapshotEngineTestAccess::set_metadata_batch_limits(engine, 2, 64ULL * 1024ULL * 1024ULL);
+
+    const SnapshotResult result = engine.create_snapshot(source, {});
+
+    EXPECT_EQ(injector->count(FailurePoint::before_metadata_batch_commit), 3U);
+    EXPECT_EQ(injector->count(FailurePoint::before_snapshot_publish), 1U);
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    EXPECT_EQ(metadata.require_complete_snapshot(result.snapshot_id).id, result.snapshot_id);
+    EXPECT_EQ(metadata.list_entries(result.snapshot_id).size(), 6U);
+}
+
+#ifndef _WIN32
+TEST(SnapshotEngineTest, ScanWarningsCountTowardTinyMetadataRecordBatches) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    std::filesystem::create_directory(source);
+    ASSERT_EQ(::mkfifo((source / "warning-0").c_str(), 0600), 0);
+    ASSERT_EQ(::mkfifo((source / "warning-1").c_str(), 0600), 0);
+    ASSERT_EQ(::mkfifo((source / "warning-2").c_str(), 0600), 0);
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    const auto injector = std::make_shared<TestFailureInjector>();
+    repository.set_failure_injector(injector);
+    SnapshotEngine engine(repository);
+    SnapshotEngineTestAccess::set_metadata_batch_limits(engine, 2, 64ULL * 1024ULL * 1024ULL);
+
+    const SnapshotResult result = engine.create_snapshot(source, {});
+
+    EXPECT_EQ(result.skipped_entries.size(), 3U);
+    EXPECT_EQ(injector->count(FailurePoint::before_metadata_batch_commit), 2U);
+    Database database(repository_root / "repository.db");
+    auto warning_count = database.statement(
+        "SELECT COUNT(*) FROM snapshot_warnings WHERE snapshot_id = :snapshot_id");
+    warning_count.bind(":snapshot_id", result.snapshot_id);
+    ASSERT_TRUE(warning_count.step());
+    EXPECT_EQ(warning_count.column_int64(0), 3);
+}
+#endif
+
+TEST(SnapshotEngineTest, FailureBetweenMetadataBatchesCleansPreviouslyCommittedEntries) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source)
+        .text_file("one", "1")
+        .text_file("two", "2")
+        .text_file("three", "3")
+        .text_file("four", "4");
+    Repository::create(repository_root);
+    SnapshotId failed_id{};
+    {
+        Repository repository = Repository::open(repository_root, OpenMode::read_write);
+        const auto injector =
+            std::make_shared<TestFailureInjector>(FailurePoint::before_metadata_batch_commit, 2);
+        repository.set_failure_injector(injector);
+        SnapshotEngine engine(repository);
+        SnapshotEngineTestAccess::set_metadata_batch_limits(engine, 2, 64ULL * 1024ULL * 1024ULL);
+
+        EXPECT_THROW((void)engine.create_snapshot(source, {}), LocalVaultError);
+        Database database(repository_root / "repository.db");
+        auto latest = database.statement("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1");
+        ASSERT_TRUE(latest.step());
+        failed_id = latest.column_int64(0);
+    }
+
+    const std::filesystem::path recovery_source = temporary.path() / "recovery-source";
+    std::filesystem::create_directory(recovery_source);
+    {
+        Repository reopened = Repository::open(repository_root, OpenMode::read_write);
+        EXPECT_NO_THROW((void)SnapshotEngine(reopened).create_snapshot(recovery_source, {}));
+    }
+
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
+    auto failed = database.statement("SELECT status FROM snapshots WHERE id = :snapshot_id");
+    failed.bind(":snapshot_id", failed_id);
+    ASSERT_TRUE(failed.step());
+    EXPECT_EQ(failed.column_text(0), "failed");
+    EXPECT_TRUE(metadata.list_entries(failed_id).empty());
+    ASSERT_EQ(metadata.list_complete_snapshots().size(), 1U);
+}
+
+TEST(SnapshotEngineTest, FailureBeforeFinalPublicationLeavesNoVisibleOrReferencedSnapshot) {
+    test::TemporaryDirectory temporary;
+    const std::filesystem::path source = temporary.path() / "source";
+    const std::filesystem::path repository_root = temporary.path() / "repository";
+    test::DatasetBuilder(source).text_file("file.txt", "contents");
+    Repository::create(repository_root);
+    Repository repository = Repository::open(repository_root, OpenMode::read_write);
+    repository.set_failure_injector(
+        std::make_shared<TestFailureInjector>(FailurePoint::before_snapshot_publish));
+
+    EXPECT_THROW((void)SnapshotEngine(repository).create_snapshot(source, {}), LocalVaultError);
+
+    Database database(repository_root / "repository.db");
+    MetadataStore metadata(database);
     auto latest = database.statement("SELECT id, status FROM snapshots ORDER BY id DESC LIMIT 1");
     ASSERT_TRUE(latest.step());
     EXPECT_EQ(latest.column_text(1), "failed");
+    EXPECT_TRUE(metadata.list_entries(latest.column_int64(0)).empty());
+    EXPECT_TRUE(metadata.list_complete_snapshots().empty());
 }
 
 } // namespace

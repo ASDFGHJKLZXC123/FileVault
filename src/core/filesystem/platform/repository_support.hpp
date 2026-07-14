@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <system_error>
 
 namespace localvault {
 
@@ -16,6 +17,8 @@ void apply_restrictive_file_permissions(const std::filesystem::path& path);
 void create_exclusive_file(const std::filesystem::path& path);
 [[nodiscard]] bool
 repository_storage_is_proven_read_only(const std::filesystem::path& root) noexcept;
+[[nodiscard]] bool platform_is_sharing_violation(const std::error_code& error) noexcept;
+void sync_existing_regular_file(const std::filesystem::path& path);
 void flush_containing_directory(const std::filesystem::path& path);
 
 } // namespace localvault

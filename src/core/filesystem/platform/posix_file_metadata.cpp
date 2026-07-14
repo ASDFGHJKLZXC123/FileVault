@@ -180,7 +180,12 @@ void TemporaryOutputFile::apply_metadata(std::int64_t modified_time_ns, std::uin
 }
 
 void TemporaryOutputFile::sync() {
-    if (::fsync(impl_->fd) != 0) {
+#if defined(__APPLE__)
+    const int result = ::fcntl(impl_->fd, F_FULLFSYNC);
+#else
+    const int result = ::fsync(impl_->fd);
+#endif
+    if (result != 0) {
         throw LocalVaultError(ErrorCode::filesystem_error,
                               "failed to sync restored temporary file: " +
                                   std::generic_category().message(errno),
