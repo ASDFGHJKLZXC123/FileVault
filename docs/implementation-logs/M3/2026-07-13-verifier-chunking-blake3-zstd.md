@@ -1,11 +1,11 @@
 # M3 Independent Verification Log
 
 Date: 2026-07-13
-Baseline: `8cbfe0eca3b368999f2138c2323290e5a048ef8d` (`HEAD`, `main`, and `origin/main`) plus the intentional uncommitted M3 tree.
+Implementation baseline: `8cbfe0eca3b368999f2138c2323290e5a048ef8d`. Verified M3 implementation head: `afa9eccb216cb4277d1ed07fc0531102e1697cdd`.
 
 ## Verdict
 
-The integrated M3 implementation has no implementation blocker. All implementation, test, and process items pass locally. The combined platform item remains PENDING because the M3 head has not been pushed, so the Linux, macOS, and Windows GitHub Actions jobs cannot yet be green for this tree.
+The integrated M3 implementation passes every implementation, test, platform/CI, and process item. There are no implementation blockers and no pending gates.
 
 Fresh verifier evidence:
 
@@ -14,7 +14,9 @@ Fresh verifier evidence:
 - `ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 build/sanitizers/tests/localvault_tests --gtest_brief=1`: 102 passed and the opt-in large test skipped, with no ASan/UBSan diagnostic. Leak detection is disabled because Apple ASan does not support the preset behavior.
 - The development cache has `LOCALVAULT_WARNINGS_AS_ERRORS=ON`; the tested binary is newer than every integrated M3 source/test edit. The implementation log records the warning-strict configure/build passing.
 - All repository C++ files passed `clang-format --dry-run --Werror`; `ruff check .`, `git diff --check`, and the focused generator check passed.
-- The implementation log records the Mac 2 GiB `large-files`, seed 12345 round trip in 170.12 seconds with maximum RSS 17,006,592 bytes. The verifier corroborated the streaming generator and manifest checks in `benchmarks/generate_dataset.py:41-80` and the >=2 GiB, byte-identical opt-in test in `tests/integration/m3_large_file_roundtrip_test.cpp:79-160`. It also records the same-seed 8 MiB+17 deterministic sample SHA-256 `c1a7c17a8372f87feea0addf9dc9703a54dad5e8968dc950c1f7b253587b0e1b`.
+- GitHub Actions [`build-and-test` run 29295154368](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29295154368) completed successfully for the exact M3 head `afa9eccb216cb4277d1ed07fc0531102e1697cdd`. Linux job `86966896783`, Windows job `86966896785`, and macOS job `86966896808` all completed successfully with Configure, Build, and Test steps green; their logs report 0 failed tests (Linux 103, Windows 99, macOS 103).
+- Initial run [`29294460533`](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29294460533) exposed MSVC warning C4996 for `getenv`, promoted to build-stopping C2220 by warnings-as-errors. Commit `afa9ecc` fixes the Windows environment lookup with `_dupenv_s`; its patch and the successful replacement run independently confirm the fix.
+- The implementation log records the Mac 2 GiB `large-files`, seed 12345 round trip in 170.12 seconds with maximum RSS 17,006,592 bytes. The verifier corroborated the streaming generator and manifest checks in `benchmarks/generate_dataset.py:41-80` and the >=2 GiB, byte-identical opt-in test in `tests/integration/m3_large_file_roundtrip_test.cpp:80-171`. It also records the same-seed 8 MiB+17 deterministic sample SHA-256 `c1a7c17a8372f87feea0addf9dc9703a54dad5e8968dc950c1f7b253587b0e1b`.
 
 ## Permanent invariant audit
 
@@ -86,8 +88,8 @@ PASS. Dedup uses the in-process cache, then the authoritative chunk row/object, 
 
 ### Platform & CI
 
-- [ ] **PENDING** — Mac local suite green; all three CI jobs green. No VM session required.
-  Evidence: Mac warning-strict build, development CTest, focused CTest, ASan/UBSan, formatting, Ruff, and diff checks are green. `.github/workflows/build-test.yml` defines Linux, macOS, and Windows jobs, but `HEAD == origin/main == 8cbfe0e` and all M3 work is uncommitted; no pushed M3 head exists, so those three external jobs are not yet claimable as PASS.
+- [x] **PASS** — Mac local suite green; all three CI jobs green. No VM session required.
+  Evidence: Mac warning-strict build, development CTest, focused CTest, ASan/UBSan, formatting, Ruff, and diff checks are green. GitHub Actions run `29295154368` is completed/success on exact commit `afa9eccb216cb4277d1ed07fc0531102e1697cdd`: Linux job `86966896783`, Windows job `86966896785`, and macOS job `86966896808` each have successful Configure, Build, and Test steps. The initial Windows C4996 `getenv` failure in run `29294460533` was corrected with `_dupenv_s` in `afa9ecc`, and the replacement run is green.
 
 ### Process
 
@@ -112,8 +114,10 @@ M2's temporary allowance for a complete snapshot regular file to have NULL `file
 
 ## Totals and gates
 
-- PASS: **20**
+- PASS: **21**
 - FAIL: **0**
-- PENDING: **1**
+- PENDING: **0**
 - Implementation blockers: **none**
-- Pending gate: push the integrated M3 head and obtain green Linux, macOS, and Windows GitHub Actions jobs.
+- Pending gates: **none**
+
+Final independent verdict: **M3 PASS**.
