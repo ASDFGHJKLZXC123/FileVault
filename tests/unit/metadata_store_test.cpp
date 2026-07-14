@@ -352,7 +352,7 @@ TEST_F(StoreFixture, BrowseQueriesExposeOnlyCompleteSnapshotMetadata) {
     ASSERT_EQ(store_.list_entries(complete).size(), 1U);
     ASSERT_EQ(store_.list_children(complete, "").size(), 1U);
     ASSERT_EQ(store_.list_entry_chunks(complete_entry).size(), 1U);
-    for (const auto [snapshot, entry_id] :
+    for (const auto& [snapshot, entry_id] :
          std::array{std::pair{snapshot_id_, pending_entry}, std::pair{failed, failed_entry},
                     std::pair{cancelled, cancelled_entry}, std::pair{deleting, deleting_entry}}) {
         EXPECT_TRUE(store_.list_entries(snapshot).empty());
