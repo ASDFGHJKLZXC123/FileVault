@@ -17,7 +17,7 @@ namespace localvault {
 class Repository;
 
 struct SnapshotOptions {
-    std::string message;
+    std::string message{};
     std::size_t worker_count{};
     bool retry_unstable_files{true};
     bool force_rehash{false};
