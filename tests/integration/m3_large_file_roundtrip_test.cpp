@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -77,7 +78,17 @@ namespace {
 }
 
 TEST(M3LargeFileRoundTripTest, ExternalDatasetRoundTripsWithBoundedChunks) {
+#ifdef _WIN32
+    char* configured_dataset = nullptr;
+    std::size_t configured_dataset_size = 0;
+    ASSERT_EQ(
+        _dupenv_s(&configured_dataset, &configured_dataset_size, "LOCALVAULT_M3_LARGE_DATASET"), 0);
+    const std::unique_ptr<char, decltype(&std::free)> configured_dataset_owner(configured_dataset,
+                                                                               &std::free);
+    static_cast<void>(configured_dataset_owner);
+#else
     const char* configured_dataset = std::getenv("LOCALVAULT_M3_LARGE_DATASET");
+#endif
     if (configured_dataset == nullptr || *configured_dataset == '\0') {
         GTEST_SKIP() << "LOCALVAULT_M3_LARGE_DATASET is not set";
     }
