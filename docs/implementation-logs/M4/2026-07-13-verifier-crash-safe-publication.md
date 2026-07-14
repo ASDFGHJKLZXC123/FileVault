@@ -2,17 +2,16 @@
 
 Date: 2026-07-13
 Baseline: `e1ce408e5bb27ce9a28ad03dffbd68a5d36a1683`
-Audited state: current uncommitted working tree on `main`
-Verdict: **implementation and local tests pass; milestone closure is pending the two external
-platform gates.**
+Verified M4 implementation head: `ae7810ba849ed782541028ca6c10e0989b12d6f2`
+External gates closed: 2026-07-14
+Verdict: **M4 passes every implementation, test, platform/CI, and process item.**
 
 ## Summary
 
-- **PASS: 18**
+- **PASS: 20**
 - **FAIL: 0**
-- **PENDING: 2**
-- **Blockers:** exact-head Linux/macOS/Windows CI has not run for this uncommitted working tree, and
-  the one-time Windows Task Manager kill/reopen probe has not been performed.
+- **PENDING: 0**
+- **Blockers:** none.
 
 The independent audit covered the complete diff from the baseline, including untracked M4 files.
 No implementation defect was found. The object publication dependency chain is preserved: object
@@ -164,21 +163,25 @@ transaction changes the snapshot from `pending` to `complete`.
 
 ### Platform & CI
 
-- [ ] **PENDING — All three CI jobs green (Windows durability code compiles and unit-level tests
-  pass).** The exact M4 working tree is uncommitted: `HEAD` is still the M3 baseline
-  `e1ce408e5bb27ce9a28ad03dffbd68a5d36a1683`. Therefore no exact-head Linux/macOS/Windows CI result
-  can exist yet. This item must remain pending until the M4 commit is pushed and all three jobs are
-  green.
+- [x] **PASS — All three CI jobs green (Windows durability code compiles and unit-level tests
+  pass).** GitHub Actions
+  [`build-and-test` run 29304667949](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29304667949)
+  completed successfully for exact M4 implementation head
+  `ae7810ba849ed782541028ca6c10e0989b12d6f2`. Linux job `86995471802`, macOS job
+  `86995471823`, and Windows job `86995471799` each completed Configure, Build, and Test
+  successfully. The first pushed head exposed one GCC `-Wrange-loop-construct` warning in a test;
+  binding that structured pair by const reference fixed the warning, and the replacement exact-head
+  run is green on all three platforms.
 
-- [ ] **PENDING — Windows VM (once): kill `localvault` mid-snapshot from Task Manager, reopen,
-  recovery is clean and old snapshots restore.** No human Windows VM result exists yet. The manual
-  probe semantics were independently inspected: setup creates a complete baseline, 600 sorted small
-  files, and a streamed configurable GiB-scale `z-large.bin`; `snapshot-to-kill` prints and flushes
-  `SAFE TO KILL NOW` only when reading the large file, after the prior 500-record transaction is
-  committed (`localvault_m4_recovery_probe.cpp:140-219`). `verify` first requires a pending row with
-  at least 500 committed entries, then triggers recovery, requires no pending/deleting or incomplete
-  metadata/temp residue, and byte-compares the restored baseline (`:222-302`). Richard must run and
-  record this gate.
+- [x] **PASS — Windows VM (once): kill `localvault` mid-snapshot from Task Manager, reopen,
+  recovery is clean and old snapshots restore.** On 2026-07-14, the human operator ran the recovery
+  probe, ended `localvault_m4_recovery_probe.exe` through Task Manager after `SAFE TO KILL NOW`, and
+  then ran `verify` against the same workspace. The probe reported:
+  `VERIFY PASS: recovery removed incomplete metadata and temporary residue; baseline snapshot
+  restored byte-identically.` The probe first requires a pending snapshot with at least 500
+  committed entries, then triggers recovery and checks that no pending/deleting or incomplete
+  metadata/temp residue remains before byte-comparing the restored baseline
+  (`localvault_m4_recovery_probe.cpp:222-302`).
 
 ### Process
 
