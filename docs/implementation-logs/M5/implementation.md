@@ -53,19 +53,23 @@
   Python AST parsing, workflow YAML parsing, preset parsing, `git diff --check`, and intentional
   diff audit. `clang-tidy`, `scan-build`, and `cppcheck` were not installed on this host.
 
-## Windows VM human gate — pending, not self-certified
+## Windows human gate and plan amendment — PASS, 2026-09-20
 
-In an Administrator `cmd.exe` on a clean Windows VM: `mkdir C:\lv-m5-junction\source`, then
-`echo payload>C:\lv-m5-junction\source\file.txt`, then `mklink /J
-C:\lv-m5-junction\source\loop C:\lv-m5-junction\source`. Confirm with `fsutil reparsepoint query
-C:\lv-m5-junction\source\loop`, build `cmake --preset windows-development
--DLOCALVAULT_WARNINGS_AS_ERRORS=ON` and `cmake --build --preset windows-development-debug
---parallel`, then set `set LOCALVAULT_M5_JUNCTION_LOOP_SOURCE=C:\lv-m5-junction\source`. Run the
-named test with a 30-second watchdog:
-`powershell -NoProfile -Command "$p=Start-Process -FilePath
-'build\windows-development\tests\Debug\localvault_tests.exe' -ArgumentList
-'--gtest_filter=FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed' -NoNewWindow
--PassThru; if(-not $p.WaitForExit(30000)){$p.Kill(); throw 'junction-loop scan did not terminate'};
-exit $p.ExitCode"`. It must pass and terminate without recursing into `loop\file.txt`. Remove only
-the junction with `rmdir C:\lv-m5-junction\source\loop` (never `rmdir /S` through the loop), then
-remove the fixture. **Human result: pending.**
+The user ran `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed` on native
+Windows 11 x64 / NTFS and reported: **"PASS: one test passed within 30 seconds; loop/file.txt
+was not traversed."** The user explicitly accepted this native Windows result in place of the
+original VM requirement. This amendment is limited to M5's junction-loop exercise; it does not
+change later milestones' VM or clean-machine checks. The real self-referencing junction and human
+observation requirements are retained. This is user-reported evidence, not agent certification.
+
+The tested source was `Latest-Dev` commit `67a77f8c84f5ea5f2a832f65098d262250ef16ef`.
+The warning-strict Debug test target was built with MSVC 19.44 and the pinned vcpkg baseline;
+the isolated test build omitted the GUI/benchmarks and Qt dependency. Saved output and GoogleTest
+XML corroborate one passing test, zero failures/errors/skips, and 0.025 s aggregate test time.
+Fixture, runner, environment, and local evidence paths are recorded in
+[verification.md](verification.md#one-time-windows-human-gate--pass).
+
+All five required CI jobs passed in [run 29376613145](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29376613145)
+at `e114307` and again in [run 35498285238](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35498285238)
+at the tested `67a77f8`: Linux, macOS, Windows, Linux ASan/UBSan, and Linux TSan. The documentation-only
+closure is finalized on `Latest-Dev` after its pushed commit also passes all five jobs.

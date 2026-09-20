@@ -35,4 +35,6 @@ Fresh critical invariant review on shutdown paths (all queues closed before any 
 
 - Fresh agent: checklist → `docs/implementation-logs/M5/`; FR-112–119 mapped; ignore-rules mapping noted.
 - Sanitizers: ASan/UBSan green locally + Linux CI; TSan clean over concurrency tests.
-- Richard: Windows VM (once) — `mklink /J` junction loop, watch the scanner skip it.
+- Richard: one human-observed real Windows junction-loop run with a 30-second watchdog. Native
+  Windows x64 / NTFS is accepted for M5 under the user-approved 2026-09-20 milestone amendment;
+  record the actual environment and user-reported result, never self-certify the human gate.

@@ -57,7 +57,15 @@ Acceptance:
 5. **"Cancellation test flakes: sometimes the snapshot completed before the cancel."** Make the dataset big enough that scan+process reliably outlasts the cancel trigger, or gate the cancel on a progress event ("after ≥100 entries processed, request stop"). Assert the post-condition (no `complete` row, recovery leaves prior snapshots intact) rather than timing.
 6. **"How do I test 'memory remains bounded'?"** Generate the many-small-files benchmark dataset (§33.2 profile A), run a snapshot, and sample peak RSS (`getrusage` on Mac/Linux) — assert it stays under a generous fixed ceiling (e.g., a few hundred MB) rather than a precise number.
 7. **"hardware_concurrency on Apple Silicon counts efficiency cores — too many workers?"** The §24.4 clamp (1..16) is the answer; don't tune further without a benchmark (disk-bound work often prefers fewer workers — §24.4's own warning).
-8. **"Junction/mount-point code is untestable on the Mac."** Correct — those scanner branches are Windows-only. Unit-test the decision function with faked attributes locally; the real junction fixture test runs in Windows CI (§32.3 Windows suite). One VM session: create a junction loop (`mklink /J`) in a test tree and watch the scanner skip it.
+8. **"Junction/mount-point code is untestable on the Mac."** Correct — those scanner branches are Windows-only. Unit-test the decision function with faked attributes locally; the real junction fixture test runs in Windows CI (§32.3 Windows suite). One human-observed Windows session: create a real junction loop in a test tree and confirm the scanner records the link without traversing it, within a 30-second watchdog.
+
+### M5 environment amendment — 2026-09-20
+
+The user approved native Windows x64 / NTFS validation in place of the original VM session for
+this junction-loop exercise. The real self-referencing junction, human-reported result, scanner
+assertions, and 30-second watchdog remain required. This amendment applies only to M5; later
+VM/clean-machine checks are unchanged. The accepted PASS is recorded in the
+[verification log](../../docs/implementation-logs/M5/verification.md#one-time-windows-human-gate--pass).
 
 ## Completion checklist
 

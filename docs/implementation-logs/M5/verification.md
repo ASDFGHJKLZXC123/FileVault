@@ -1,22 +1,29 @@
 # M5 independent verification
 
-Date: 2026-07-14 (America/Los_Angeles)
-Verifier role: fresh independent verifier; no implementation or repair performed.
+Independent verification date: 2026-07-14 (America/Los_Angeles).
+Original verifier role: fresh independent verifier; no implementation or repair performed.
+Closure supplement: 2026-09-20; user-reported Windows result and confirmed GitHub Actions evidence.
+The July automated results below are retained as historical evidence, not represented as rerun today.
 
 ## Result
 
-- Milestone checklist: **21 PASS / 0 FAIL / 2 PENDING** (23 items total).
+- Milestone checklist: **23 PASS / 0 FAIL / 0 PENDING** (23 items total).
 - Local automated gates: **PASS**; no local automated item remains pending. A first
   `ruff format --check` found two benchmark Python files needing formatting; Packet G made the
   narrow formatting-only repair, and the affected format/lint/AST/diff gates were independently
   rerun and passed.
-- External/human supplement: **1 PENDING HUMAN** for the one-time Windows VM junction exercise.
-- Exact blockers to milestone closure:
-  1. **PENDING CI:** there is no pushed exact-head run for the current M5 worktree. The Linux
-     ASan/UBSan job and the complete Linux/macOS/Windows workflow (including the Windows native
-     junction fixture) must be green on the pushed M5 commit.
-  2. **PENDING HUMAN:** Richard must perform the one-time Windows VM `mklink /J` loop exercise. An
-     agent cannot self-certify it.
+- External/human supplement: **PASS**, reported by the user on 2026-09-20 for the real Windows
+  junction loop. The user approved native Windows host validation in place of the original VM
+  requirement; see the human gate below. No VM run is claimed.
+- CI evidence: all five jobs passed for `e114307` in
+  [run 29376613145](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/29376613145), and for
+  `67a77f8c84f5ea5f2a832f65098d262250ef16ef` in
+  [run 35498285238](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35498285238).
+  Both cover Linux, macOS, Windows, Linux ASan/UBSan, and Linux TSan. The latter is the exact source
+  commit used for the human test.
+- All M5 acceptance gates are satisfied. Announce branch finalization only after the pushed
+  documentation-only closure commit on `Latest-Dev` also passes all five jobs and the working tree
+  is clean and synchronized with `origin/Latest-Dev`.
 
 ## Independently rerun gates
 
@@ -91,7 +98,7 @@ transaction. Proving tests are
 | FR-114 — `.localvaultignore` | **Assigned to M5 scanner work.** Root `.localvaultignore` is the default; explicit `SnapshotOptions::ignore_file` replaces it entirely and never merges. CLI spelling/parsing for `--ignore-file` remains M7; M5 proves the core replacement behavior. Negation is explicitly deferred/literal. | `IgnoreRulesTest.ExplicitFileReplacesRootRulesRatherThanMerging`; `IgnoreRulesTest.WildcardsStayWithinOnePathComponent`; `IgnoreRulesTest.DirectoryMatchSignalsThatRecursionCanBePruned`; `FileScannerTest.IgnoreRulesPruneDirectoriesBeforeEnumeratingTheirChildren`; `SnapshotEngineTest.StreamsHiddenAndReplacementIgnoreOptionsIntoScanner` |
 | FR-115 — progress callback | Worker-updated atomics; coordinator throttling; totals absent during scan and exact afterward; callback publication boundary follows the M4 amendment above. | `M5PipelineTest.ProgressIsBoundedMonotonicAndPublishesExactTotalsAfterScanning`; `M5PipelineTest.ProgressCallbackFailureStopsPipelineAndLeavesSnapshotIncomplete`; `M5PipelineTest.CompleteProgressCallbackFailureCannotRetractPublishedSnapshot`; `M5PipelineTest.UnstableWarningDoesNotIncrementProcessedOrChunkCounters` |
 | FR-116 — Windows sharing warning | Filesystem/open failures retry once, then warn and skip while the snapshot completes as partial success. | `SnapshotEngineTest.PermissionAndSharingSourceErrorsWarnAndSkip` |
-| FR-117 — mount/junction safety | Pure decision function captures junctions as link entries without recursion and warns/skips volume mounts; Win32 no-follow reparse classification is present. Exact-head native Windows execution remains part of the pending CI item. | `FileScannerDecisionTest.FakedPlatformAttributesChooseSafeActions`; Windows CI: `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed` |
+| FR-117 — mount/junction safety | Pure decision function captures junctions as link entries without recursion and warns/skips volume mounts; Win32 no-follow reparse classification is present. Windows CI passed in runs 29376613145 and 35498285238; the user-reported self-junction loop passed on native Windows on 2026-09-20. | `FileScannerDecisionTest.FakedPlatformAttributesChooseSafeActions`; Windows CI and human loop: `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed` |
 | FR-118 — cloud placeholders | Win32 recall attributes are classified without hydration and cause warn/skip. | `FileScannerDecisionTest.FakedPlatformAttributesChooseSafeActions` |
 | FR-119 — one filesystem/volume | Scanner compares POSIX device or Windows volume identity to the root and applies the faked boundary decision before recursion. | `FileScannerDecisionTest.HiddenAndFilesystemBoundaryOptionsAreAppliedToFakeFacts` |
 
@@ -186,45 +193,55 @@ M5 is complete only when **every** box is checked. Copy this checklist into the 
 
 **Platform & CI**
 
-- [ ] ASan/UBSan preset green locally on the Mac **and** on the Linux sanitizer CI job (acceptance).
-  - **PENDING CI:** local Mac ASan/UBSan is PASS via the required direct-executable workaround
-    (177 passed/one opt-in skip; no diagnostics). The workflow defines `linux-sanitizers`, but no
-    pushed exact-head run exists for this uncommitted M5 worktree, so the required Linux half cannot
-    yet be certified.
+- [x] ASan/UBSan preset green locally on the Mac **and** on the Linux sanitizer CI job (acceptance).
+  - **PASS:** local Mac ASan/UBSan passed via the required direct-executable workaround
+    (177 passed/one opt-in skip; no diagnostics). The `linux-sanitizers` configure/build/test job
+    passed in runs 29376613145 (`e114307`) and 35498285238 (`67a77f8`).
 - [x] TSan run over the concurrency-focused tests (locally on the Mac and/or the Linux job) — clean (acceptance).
   - **PASS:** local Mac TSan preset filter passed 19/19 in 32.83 s with no diagnostics; the
     disjunctive local-and/or-CI requirement is satisfied. The workflow also defines `linux-tsan`.
-- [ ] All three CI jobs green; the junction/one-file-system fixture tests pass on the Windows CI job.
-  - **PENDING CI:** `.github/workflows/build-test.yml` parses and defines Linux, Linux sanitizers,
-    Linux TSan, macOS, and Windows jobs, with full CTest on Windows. The M5 worktree is not yet a
-    pushed exact head, so no corresponding all-green run or Windows-native
-    `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed` result exists.
+- [x] All three CI jobs green; the junction/one-file-system fixture tests pass on the Windows CI job.
+  - **PASS:** Linux, macOS, and Windows configure/build/test jobs passed in runs 29376613145
+    (`e114307`) and 35498285238 (`67a77f8`), alongside both Linux sanitizer jobs. Full Windows CTest
+    includes `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed` and the
+    one-file-system decision fixture. The separate user-observed junction loop also passed below.
 
 **Process**
 
 - [x] Implementation + verification logs under `docs/implementation-logs/M5/`, including this checklist's state.
   - **PASS:** `docs/implementation-logs/M5/implementation.md` and this
     `docs/implementation-logs/M5/verification.md` contain the decision record, independent gates,
-    complete checklist, review closure, amendments, and pending external state.
+    complete checklist, review closure, amendments, and completed external/human evidence.
 - [x] Log records FR-112–FR-119 and FR-114 with proving test names; notes the ignore-rules mapping decision.
   - **PASS:** the complete FR table above names tests for every FR-112..FR-119 item and explicitly
     records that M5 owns scanner ignore rules while an explicit file replaces rather than merges
     the root rules.
 
-## One-time Windows VM gate
+## One-time Windows human gate — PASS
 
-**PENDING HUMAN — cannot be self-certified by this verifier.** In an Administrator `cmd.exe` on a
-clean Windows VM: `mkdir C:\lv-m5-junction\source`, then
-`echo payload>C:\lv-m5-junction\source\file.txt`, then
-`mklink /J C:\lv-m5-junction\source\loop C:\lv-m5-junction\source`. Confirm with
-`fsutil reparsepoint query C:\lv-m5-junction\source\loop`, build with
-`cmake --preset windows-development -DLOCALVAULT_WARNINGS_AS_ERRORS=ON` and
-`cmake --build --preset windows-development-debug --parallel`, then set
-`set LOCALVAULT_M5_JUNCTION_LOOP_SOURCE=C:\lv-m5-junction\source`. Run the named test with a
-30-second watchdog: `powershell -NoProfile -Command "$p=Start-Process -FilePath
-'build\windows-development\tests\Debug\localvault_tests.exe' -ArgumentList
-'--gtest_filter=FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed' -NoNewWindow
--PassThru; if(-not $p.WaitForExit(30000)){$p.Kill(); throw 'junction-loop scan did not terminate'};
-exit $p.ExitCode"`. It must pass and terminate without recursing into `loop\file.txt`. Remove only
-the junction with `rmdir C:\lv-m5-junction\source\loop` (never `rmdir /S` through the loop), then
-remove the fixture.
+On 2026-09-20 the user ran the prepared runner and reported:
+
+> PASS: one test passed within 30 seconds; loop/file.txt was not traversed.
+
+The user subsequently approved accepting this native Windows run in place of the originally
+specified VM exercise. This is a documented M5-only environment amendment, not a claim that a VM
+test occurred or an agent-certified human result. Future VM/clean-machine requirements remain.
+
+- Source commit: `67a77f8c84f5ea5f2a832f65098d262250ef16ef` on `Latest-Dev`.
+- Environment: Windows 11 Pro for Workstations x64, version `10.0.26200`; NTFS on `D:`.
+- Build: MSVC 19.44, x64 Debug, warnings as errors; pinned vcpkg commit/baseline
+  `03e366fb91e38b9432ebd5f8cc79f7c8f55e96ab`. The isolated `localvault_tests` build used the project
+  dependencies except Qt, with GUI and benchmarks disabled; this was not a full GUI build.
+- Fixture: `D:\LocalVault\build\m5-junction\source\file.txt` plus a real `loop` junction pointing
+  to `D:\LocalVault\build\m5-junction\source`. `fsutil reparsepoint query` confirmed the mount-point
+  reparse tag `0xa0000003` and the self-referencing target.
+- Runner: `D:\LocalVault\build\m5-junction\run-test.ps1`; sets
+  `LOCALVAULT_M5_JUNCTION_LOOP_SOURCE`, runs only
+  `FileScannerTest.NativeWindowsJunctionIsCapturedAndNeverTraversed`, enforces a 30-second
+  watchdog, and rejects failures, skipped tests, or a filter matching zero tests.
+- Local artifacts: `build/m5-junction/results-20260920-150528-909/{stdout.txt,stderr.txt,result.xml}`.
+  These are ignored local files. Their relevant results are preserved here: stdout reports
+  `[  PASSED  ] 1 test.`, stderr is empty, and XML records `tests=1`, `failures=0`, `errors=0`,
+  `disabled=0`, suite `skipped=0`, and aggregate `time=0.025` seconds. The test case took 0.002 s.
+- The test asserts that `loop` is captured as a symbolic link with a nonempty target and
+  `loop/file.txt` is absent from scanned entries. The user confirmed the guarded run's PASS.
