@@ -7,7 +7,9 @@
 #include <string_view>
 #include <utility>
 
+#include "database/locked_read_vfs.hpp"
 #include "database/statement.hpp"
+#include "filesystem/platform/path_safety.hpp"
 #include "localvault/error.hpp"
 
 namespace localvault {
@@ -135,11 +137,36 @@ Database::Database(const std::filesystem::path& path, bool read_only)
 Database::Database(const std::filesystem::path& path, DatabaseAccess access) {
     const bool immutable = access == DatabaseAccess::immutable_read_only;
     const bool writable = access == DatabaseAccess::read_write;
+    const bool locked_read_only = access == DatabaseAccess::locked_read_only;
+    const char* vfs = nullptr;
+    if (locked_read_only) {
+        auto wal_path = path;
+        wal_path += "-wal";
+        for (const auto& candidate : {path, wal_path}) {
+            std::error_code error;
+            const auto status = std::filesystem::symlink_status(candidate, error);
+            if (error || !std::filesystem::is_regular_file(status) ||
+                inspect_path_no_follow(candidate) != NoFollowPathType::other) {
+                throw LocalVaultError(ErrorCode::database_error,
+                                      "locked read-only view requires regular database and WAL files",
+                                      candidate);
+            }
+        }
+        // SQLite may delete an existing WAL when opening an empty main database,
+        // even for a read-only connection. Reject it before entering the pager.
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error || size < 100) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "locked read-only view requires a complete database header", path);
+        }
+        vfs = locked_read_vfs_name();
+    }
     const int flags =
         writable ? SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
                  : SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | (immutable ? SQLITE_OPEN_URI : 0);
     const std::string sqlite_path = immutable ? immutable_database_uri(path) : path_to_utf8(path);
-    const int result = sqlite3_open_v2(sqlite_path.c_str(), &database_, flags, nullptr);
+    const int result = sqlite3_open_v2(sqlite_path.c_str(), &database_, flags, vfs);
     if (result != SQLITE_OK) {
         const std::string detail =
             database_ == nullptr ? "unknown SQLite error" : sqlite3_errmsg(database_);
@@ -193,6 +220,21 @@ void Database::execute(std::string_view sql) const {
 }
 
 void Database::initialize_connection(DatabaseAccess access) {
+    if (access == DatabaseAccess::locked_read_only) {
+        int enabled = 0;
+        if (sqlite3_db_config(database_, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &enabled) !=
+                SQLITE_OK ||
+            enabled != 1) {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "could not disable checkpointing for a locked read-only view");
+        }
+        // The locked-read VFS plus EXCLUSIVE before the first read gives SQLite a private
+        // heap WAL index. URI nolock=1 would instead disable WAL support entirely.
+        if (text_pragma(database_, "PRAGMA locking_mode = EXCLUSIVE") != "exclusive") {
+            throw LocalVaultError(ErrorCode::database_error,
+                                  "could not enable private WAL indexing for read-only view");
+        }
+    }
     run_pragma(database_, "PRAGMA foreign_keys = ON");
     if (access == DatabaseAccess::read_write) {
         run_pragma(database_, "PRAGMA journal_mode = WAL");

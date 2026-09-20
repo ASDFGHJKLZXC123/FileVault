@@ -31,6 +31,7 @@
 #include "database/statement.hpp"
 #include "filesystem/platform/platform_lock.hpp"
 #include "localvault/error.hpp"
+#include "localvault/garbage_collector.hpp"
 #include "localvault/repository.hpp"
 #include "localvault/restore_engine.hpp"
 #include "localvault/snapshot_engine.hpp"
@@ -60,6 +61,7 @@ struct ChildResult {
     case FailurePoint::before_snapshot_publish:
         return "before_snapshot_publish";
     case FailurePoint::during_restore_write:
+    case FailurePoint::after_gc_object_delete:
         break;
     }
     throw std::runtime_error("restore failure point is not a snapshot crash point");
@@ -378,6 +380,11 @@ TEST(M4CrashSafety, EveryFailurePointPreservesPriorSnapshotAndCleansTemporaryRes
                 object_paths_for_snapshot(database, old_snapshot_id, repository_root);
             ASSERT_FALSE(old_object_paths.empty());
 
+            if (point == FailurePoint::after_gc_object_delete) {
+                const auto disposable =
+                    SnapshotEngine(repository).create_snapshot(new_source, {}).snapshot_id;
+                GarbageCollector(repository).delete_snapshot(disposable);
+            }
             repository.set_failure_injector(std::make_shared<ThrowAtFailurePoint>(point));
             if (point == FailurePoint::during_restore_write) {
                 EXPECT_THROW((void)RestoreEngine(repository)
@@ -390,6 +397,9 @@ TEST(M4CrashSafety, EveryFailurePointPreservesPriorSnapshotAndCleansTemporaryRes
                              std::runtime_error);
                 ASSERT_TRUE(std::filesystem::is_directory(destination));
                 EXPECT_TRUE(std::filesystem::is_empty(destination));
+            } else if (point == FailurePoint::after_gc_object_delete) {
+                EXPECT_THROW((void)GarbageCollector(repository).collect({.dry_run = false}),
+                             std::runtime_error);
             } else {
                 EXPECT_THROW((void)SnapshotEngine(repository).create_snapshot(new_source, {}),
                              LocalVaultError);
@@ -439,7 +449,11 @@ TEST(M4CrashSafety, EveryFailurePointPreservesPriorSnapshotAndCleansTemporaryRes
             "SELECT COUNT(*) FROM snapshots WHERE id > :old_snapshot_id AND status = 'failed'");
         failed.bind(":old_snapshot_id", old_snapshot_id);
         ASSERT_TRUE(failed.step());
-        EXPECT_EQ(failed.column_int64(0), point == FailurePoint::during_restore_write ? 0 : 1);
+        EXPECT_EQ(failed.column_int64(0),
+                  point == FailurePoint::during_restore_write ||
+                          point == FailurePoint::after_gc_object_delete
+                      ? 0
+                      : 1);
     }
 }
 
@@ -473,6 +487,7 @@ TEST(M4CrashSafety, ActualSnapshotRestoreAndDeletingLifecycleHitsEveryFailurePoi
         metadata.delete_deleting_snapshot(snapshot_id, *injector, 1);
         (void)writer_lock;
     }
+    (void)GarbageCollector(repository).collect({.dry_run = false});
 
     for (const FailurePoint point : all_failure_points) {
         EXPECT_TRUE(injector->saw(point)) << static_cast<int>(point);

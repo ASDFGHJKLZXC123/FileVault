@@ -23,6 +23,7 @@
 #include "database/transaction.hpp"
 #include "filesystem/creation_ledger.hpp"
 #include "filesystem/filesystem_classifier.hpp"
+#include "filesystem/platform/path_safety.hpp"
 #include "filesystem/platform/platform_lock.hpp"
 #include "filesystem/platform/repository_support.hpp"
 #include "localvault/error.hpp"
@@ -34,6 +35,28 @@ namespace {
 class NoopFailureInjector final : public FailureInjector {
   public:
     void hit(FailurePoint) override {}
+};
+
+void check_recovery_stop(std::stop_token token) {
+    if (token.stop_requested()) {
+        throw LocalVaultError(ErrorCode::cancelled, "repository recovery cancelled");
+    }
+}
+
+class RecoveryFailureInjector final : public FailureInjector {
+  public:
+    RecoveryFailureInjector(FailureInjector& delegate, std::stop_token token)
+        : delegate_(delegate), token_(token) {}
+
+    void hit(FailurePoint point) override {
+        check_recovery_stop(token_);
+        delegate_.hit(point);
+        check_recovery_stop(token_);
+    }
+
+  private:
+    FailureInjector& delegate_;
+    std::stop_token token_;
 };
 
 [[nodiscard]] const std::shared_ptr<FailureInjector>& noop_failure_injector() {
@@ -375,7 +398,8 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
     apply_restrictive_file_permissions(ledger[index].path);
 }
 
-[[nodiscard]] bool remove_recovery_path(const std::filesystem::path& path) {
+[[nodiscard]] bool remove_recovery_path(const std::filesystem::path& path, std::stop_token token) {
+    check_recovery_stop(token);
     std::error_code error;
     (void)std::filesystem::remove_all(path, error);
     if (!error) {
@@ -389,7 +413,9 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
                           "failed to remove temporary recovery path: " + error.message(), path);
 }
 
-[[nodiscard]] bool clear_directory_contents(const std::filesystem::path& directory) {
+[[nodiscard]] bool clear_directory_contents(const std::filesystem::path& directory,
+                                             std::stop_token token) {
+    check_recovery_stop(token);
     std::error_code error;
     std::filesystem::directory_iterator iterator(directory, error);
     if (error) {
@@ -402,7 +428,7 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
     const std::filesystem::directory_iterator end;
     while (iterator != end) {
         const std::filesystem::path path = iterator->path();
-        complete = remove_recovery_path(path) && complete;
+        complete = remove_recovery_path(path, token) && complete;
         iterator.increment(error);
         if (error) {
             throw LocalVaultError(ErrorCode::filesystem_error,
@@ -434,7 +460,9 @@ void require_recovery_directory(const std::filesystem::path& directory) {
     }
 }
 
-[[nodiscard]] bool clear_temporary_tree(const std::filesystem::path& repository_root) {
+[[nodiscard]] bool clear_temporary_tree(const std::filesystem::path& repository_root,
+                                        std::stop_token token) {
+    check_recovery_stop(token);
     const std::filesystem::path temporary = repository_root / "temporary";
     const std::filesystem::path temporary_objects = temporary / "objects";
     const std::filesystem::path temporary_restores = temporary / "restores";
@@ -449,12 +477,13 @@ void require_recovery_directory(const std::filesystem::path& directory) {
     }
     const std::filesystem::directory_iterator end;
     while (iterator != end) {
+        check_recovery_stop(token);
         const std::filesystem::path path = iterator->path();
         if (path == temporary_objects || path == temporary_restores) {
             require_recovery_directory(path);
-            complete = clear_directory_contents(path) && complete;
+            complete = clear_directory_contents(path, token) && complete;
         } else {
-            complete = remove_recovery_path(path) && complete;
+            complete = remove_recovery_path(path, token) && complete;
         }
         iterator.increment(error);
         if (error) {
@@ -464,6 +493,7 @@ void require_recovery_directory(const std::filesystem::path& directory) {
                                   temporary);
         }
     }
+    check_recovery_stop(token);
     require_recovery_directory(temporary_objects);
     require_recovery_directory(temporary_restores);
     return complete;
@@ -475,10 +505,12 @@ class Repository::Impl final {
   public:
     Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database> database,
          OpenMode mode)
-        : root_(std::move(root)), info_(std::move(info)), database_(std::move(database)),
+        : root_(std::move(root)), canonical_root_(std::filesystem::canonical(root_)),
+          info_(std::move(info)), database_(std::move(database)),
           mode_(mode), failure_injector_(noop_failure_injector()) {}
 
     std::filesystem::path root_;
+    std::filesystem::path canonical_root_;
     RepositoryInfo info_;
     std::unique_ptr<Database> database_;
     OpenMode mode_;
@@ -743,8 +775,28 @@ std::shared_ptr<FailureInjector> Repository::failure_injector() const noexcept {
     return impl_->failure_injector_;
 }
 
-void Repository::recover_after_writer_lock() {
-    if (impl_->recovery_complete_) {
+void Repository::validate_root_after_open() const {
+    std::error_code error;
+    if (inspect_path_no_follow(impl_->root_) != NoFollowPathType::directory ||
+        std::filesystem::canonical(impl_->root_, error) != impl_->canonical_root_ || error) {
+        throw LocalVaultError(ErrorCode::filesystem_error,
+                              "repository root changed or became indirect after opening",
+                              impl_->root_);
+    }
+    auto current = impl_->canonical_root_.root_path();
+    for (const auto& component : impl_->canonical_root_.relative_path()) {
+        current /= component;
+        if (inspect_path_no_follow(current) != NoFollowPathType::directory) {
+            throw LocalVaultError(ErrorCode::filesystem_error,
+                                  "repository root has an indirect or non-directory ancestor",
+                                  current);
+        }
+    }
+}
+
+void Repository::recover_after_writer_lock(bool force, std::stop_token token) {
+    check_recovery_stop(token);
+    if (impl_->recovery_complete_ && !force) {
         return;
     }
     if (impl_->mode_ != OpenMode::read_write) {
@@ -752,23 +804,26 @@ void Repository::recover_after_writer_lock() {
                               "recovery requires a read-write repository", impl_->root_);
     }
 
+    impl_->recovery_complete_ = false;
+    RecoveryFailureInjector injector(*impl_->failure_injector_, token);
     MetadataStore metadata(*impl_->database_);
     for (const IncompleteSnapshotInfo& snapshot : metadata.list_incomplete_snapshots()) {
+        check_recovery_stop(token);
         switch (snapshot.status) {
         case SnapshotStatus::pending:
             metadata.mark_stale_pending_snapshot_failed(
                 snapshot.id, "snapshot operation was interrupted before publication", utc_now_ns(),
-                *impl_->failure_injector_);
-            metadata.clean_incomplete_snapshot(snapshot.id, *impl_->failure_injector_,
+                injector);
+            metadata.clean_incomplete_snapshot(snapshot.id, injector,
                                                impl_->recovery_entry_batch_limit_);
             break;
         case SnapshotStatus::failed:
         case SnapshotStatus::cancelled:
-            metadata.clean_incomplete_snapshot(snapshot.id, *impl_->failure_injector_,
+            metadata.clean_incomplete_snapshot(snapshot.id, injector,
                                                impl_->recovery_entry_batch_limit_);
             break;
         case SnapshotStatus::deleting:
-            metadata.delete_deleting_snapshot(snapshot.id, *impl_->failure_injector_,
+            metadata.delete_deleting_snapshot(snapshot.id, injector,
                                               impl_->recovery_entry_batch_limit_);
             break;
         case SnapshotStatus::complete:
@@ -777,7 +832,8 @@ void Repository::recover_after_writer_lock() {
         }
     }
 
-    const bool temporary_cleanup_complete = clear_temporary_tree(impl_->root_);
+    const bool temporary_cleanup_complete = clear_temporary_tree(impl_->root_, token);
+    check_recovery_stop(token);
     metadata.quick_relationship_check();
     impl_->recovery_complete_ = temporary_cleanup_complete;
 }

@@ -72,8 +72,10 @@ struct RepositoryLock::Impl {
 
 RepositoryLock::RepositoryLock(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
-RepositoryLock RepositoryLock::acquire_exclusive(const std::filesystem::path& lock_file) {
-    const int fd = ::open(lock_file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+RepositoryLock RepositoryLock::acquire_exclusive(const std::filesystem::path& lock_file,
+                                                 bool write_owner_diagnostics) {
+    const int flags = O_RDWR | O_CLOEXEC | (write_owner_diagnostics ? O_CREAT : 0);
+    const int fd = ::open(lock_file.c_str(), flags, 0600);
     if (fd == -1) {
         throw_filesystem_error(lock_file, "failed to open repository lock file", errno);
     }
@@ -88,7 +90,9 @@ RepositoryLock RepositoryLock::acquire_exclusive(const std::filesystem::path& lo
         throw_filesystem_error(lock_file, "failed to acquire repository lock", error_number);
     }
 
-    write_diagnostics(fd, lock_file);
+    if (write_owner_diagnostics) {
+        write_diagnostics(fd, lock_file);
+    }
     return RepositoryLock(std::move(impl));
 }
 

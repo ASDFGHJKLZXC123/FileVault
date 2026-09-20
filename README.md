@@ -3,13 +3,15 @@ LocalVault
 
 LocalVault is an offline-first, content-addressed snapshot backup application.
 
-This repository starts with the build-and-test scaffold required by the project plan:
+The core library supports:
 
-- CMake + vcpkg toolchain
-- Presets for Linux/macOS/Windows
-- Qt desktop and CLI targets
-- Core library target and a placeholder test target
-- GitHub Actions CI for configure/build/test on Linux, macOS, and Windows
+- Chunked snapshots with BLAKE3, zstd, deduplication, cancellation, and crash recovery
+- Safe restoration with byte verification
+- Snapshot browsing, path search, streaming diff, and storage statistics
+- Quick/full integrity verification, resumable snapshot deletion, and GC preview/execution
+
+CMake + vcpkg presets build and test Linux, macOS, and Windows. GitHub Actions also runs
+ASan/UBSan and TSan. The CLI and Qt targets remain scaffolds; M7 and M8 add their complete interfaces.
 
 ## Build plan
 

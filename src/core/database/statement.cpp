@@ -98,7 +98,9 @@ void Statement::bind(std::string_view name, std::string_view value) {
     if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw LocalVaultError(ErrorCode::database_error, "SQLite text value is too large");
     }
-    const int result = sqlite3_bind_text(statement_, parameter_index(name), value.data(),
+    // SQLite interprets a null pointer as SQL NULL, including an empty string_view's data().
+    const int result = sqlite3_bind_text(statement_, parameter_index(name),
+                                         value.empty() ? "" : value.data(),
                                          static_cast<int>(value.size()), SQLITE_TRANSIENT);
     if (result != SQLITE_OK) {
         throw_sqlite_error(database_, "binding text", sql_, result);

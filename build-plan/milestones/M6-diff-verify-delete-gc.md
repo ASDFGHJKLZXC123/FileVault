@@ -65,7 +65,7 @@ M6 is complete only when **every** box is checked. Copy this checklist into the 
 - [ ] `DiffEngine`: two sorted SQL cursors, streaming merge, classification per §20.2 (symlink target change = `content_modified`), directory-mtime-noise suppression option, root row excluded.
 - [ ] Quick verification performs all eleven §21.1 checks (integrity_check, FK check, `repository_info` row, format/algorithms, counters, chunk rows, object existence, object sizes, derived-path match, stale non-complete snapshots, stale temp files).
 - [ ] Full verification decompresses and re-hashes every distinct referenced chunk; reports all issues rather than stopping at the first (§21.2). Decision recorded on the optional `--files` reconstruction mode.
-- [ ] Issue severity per §21.3: missing/corrupt **referenced** objects fatal; orphans are GC candidates, not corruption; correct nonzero exit mapping.
+- [ ] Issue severity per §21.3: missing/corrupt **referenced** objects make the core verification result fail; orphans are nonfatal GC candidates. M7 maps this result to command exit code 5 (zero for clean-with-notes).
 - [ ] Snapshot delete: refuses a pending-in-use snapshot, uses the M4 `deleting` machinery, keeps objects unless `--gc` (§22.1).
 - [ ] GC order: exclusive lock → recovery → unreferenced query (§22.2) → recheck → delete object file, then row, in bounded batches (§22.4); orphan object files handled per §22.5.
 - [ ] `gc --dry-run` reports counts/bytes and performs zero writes (§22.3).
@@ -84,7 +84,7 @@ M6 is complete only when **every** box is checked. Copy this checklist into the 
 
 **Platform & CI**
 
-- [ ] Mac local suite green; all three CI jobs green. No VM session required (optionally verify a VM-created repository for a free portability point).
+- [ ] Active native development host suite green; Linux, macOS, Windows, Linux ASan/UBSan, and Linux TSan CI jobs green. Record the actual local host; do not claim an unavailable Mac-local run. No VM session required (optionally verify a VM-created repository for a free portability point).
 
 **Process**
 

@@ -20,6 +20,7 @@ add_library(
     localvault_core
     core.cpp
     database/database.cpp
+    database/locked_read_vfs.cpp
     database/metadata_store.cpp
     database/migrations.cpp
     database/statement.cpp
@@ -27,6 +28,10 @@ add_library(
     filesystem/filesystem_classifier.cpp
     filesystem/file_scanner.cpp
     filesystem/ignore_rules.cpp
+    diff_engine.cpp
+    garbage_collector.cpp
+    integrity_verifier.cpp
+    query_service.cpp
     repository.cpp
     restore_engine.cpp
     snapshot_engine.cpp

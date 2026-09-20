@@ -4,15 +4,26 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "database/database.hpp"
 #include "database/statement.hpp"
 #include "database/transaction.hpp"
+#include "filesystem/platform/platform_lock.hpp"
 #include "localvault/error.hpp"
+#include "support/test_filesystem.hpp"
 
 namespace {
 
@@ -81,6 +92,27 @@ TEST(Database, ConfiguresEveryConnection) {
     EXPECT_EQ(journal_mode.column_text(0), "wal");
 }
 
+TEST(Statement, EmptyTextBindingsRemainDistinctFromNull) {
+    TemporaryDatabase temporary;
+    localvault::Database database(temporary.path());
+    auto query = database.statement(
+        "SELECT :default_empty, typeof(:default_empty), :literal_empty, :bytes, :null");
+    query.bind(":default_empty", std::string_view{});
+    query.bind(":literal_empty", "");
+    query.bind(":bytes", std::string_view("a\0b", 3));
+    query.bind_null(":null");
+
+    ASSERT_TRUE(query.step());
+    ASSERT_FALSE(query.column_is_null(0));
+    EXPECT_EQ(query.column_text(0), "");
+    EXPECT_EQ(query.column_text(1), "text");
+    ASSERT_FALSE(query.column_is_null(2));
+    EXPECT_EQ(query.column_text(2), "");
+    EXPECT_EQ(query.column_text(3), std::string("a\0b", 3));
+    EXPECT_TRUE(query.column_is_null(4));
+    EXPECT_FALSE(query.step());
+}
+
 TEST(Database, ReadOnlyConnectionUsesRequiredSettings) {
     TemporaryDatabase temporary;
     {
@@ -110,6 +142,83 @@ TEST(Database, ReadOnlyConnectionCreatesNoDirectoryEntries) {
         EXPECT_EQ(scalar_int(read_only, "SELECT COUNT(*) FROM item"), 0);
         EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
     }
+    EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
+}
+
+TEST(Database, LockedReadOnlyReadsLiveWalWithoutChangingAnyDatabaseFile) {
+    TemporaryDatabase temporary;
+    localvault::Database writable(temporary.path());
+    writable.execute("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    // Place the schema in the main database, then leave the row only in the WAL.
+    auto checkpoint = writable.statement("PRAGMA wal_checkpoint(TRUNCATE)");
+    ASSERT_TRUE(checkpoint.step());
+    ASSERT_EQ(checkpoint.column_int64(0), 0);
+    ASSERT_FALSE(checkpoint.step());
+    writable.execute("INSERT INTO item (id) VALUES (42)");
+    ASSERT_GT(std::filesystem::file_size(temporary.path().string() + "-wal"), 0U);
+
+    auto lock = localvault::RepositoryLock::acquire_exclusive(temporary.root() / "repository.lock");
+    const auto capture = [&] {
+        std::map<std::string, std::vector<std::byte>> files;
+        for (const std::string suffix : {"", "-wal", "-shm"}) {
+            auto path = temporary.path();
+            path += suffix;
+            files.emplace(suffix, localvault::test::read_all_bytes(path));
+        }
+        return files;
+    };
+    const auto entries_before = directory_entry_names(temporary.root());
+    const auto before = capture();
+    {
+        localvault::Database reader(temporary.path(), localvault::DatabaseAccess::locked_read_only);
+        EXPECT_EQ(scalar_int(reader, "SELECT id FROM item"), 42);
+        EXPECT_EQ(capture(), before);
+        EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
+        EXPECT_THROW(reader.execute("INSERT INTO item (id) VALUES (43)"),
+                     localvault::LocalVaultError);
+        EXPECT_EQ(capture(), before);
+    }
+    EXPECT_EQ(capture(), before);
+    EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
+    EXPECT_EQ(scalar_int(writable, "SELECT COUNT(*) FROM item"), 1);
+}
+
+TEST(Database, LockedReadOnlyRejectsMissingOrNonregularWalWithoutCreatingFiles) {
+    TemporaryDatabase temporary;
+    {
+        localvault::Database writable(temporary.path());
+        writable.execute("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    }
+    auto wal_path = temporary.path();
+    wal_path += "-wal";
+    ASSERT_TRUE(std::filesystem::remove(wal_path));
+    const auto before = localvault::test::read_all_bytes(temporary.path());
+    const auto entries_before = directory_entry_names(temporary.root());
+    EXPECT_THROW(localvault::Database(temporary.path(), localvault::DatabaseAccess::locked_read_only),
+                 localvault::LocalVaultError);
+    EXPECT_EQ(localvault::test::read_all_bytes(temporary.path()), before);
+    EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
+    ASSERT_TRUE(std::filesystem::create_directory(wal_path));
+    EXPECT_THROW(localvault::Database(temporary.path(), localvault::DatabaseAccess::locked_read_only),
+                 localvault::LocalVaultError);
+    EXPECT_TRUE(std::filesystem::is_directory(wal_path));
+}
+
+TEST(Database, LockedReadOnlyPreservesWalWhenMainDatabaseIsEmpty) {
+    TemporaryDatabase temporary;
+    {
+        localvault::Database writable(temporary.path());
+        writable.execute("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    }
+    auto wal_path = temporary.path();
+    wal_path += "-wal";
+    const auto wal_before = localvault::test::read_all_bytes(wal_path);
+    localvault::test::truncate_file(temporary.path(), 0);
+    const auto entries_before = directory_entry_names(temporary.root());
+    EXPECT_THROW(localvault::Database(temporary.path(), localvault::DatabaseAccess::locked_read_only),
+                 localvault::LocalVaultError);
+    EXPECT_EQ(std::filesystem::file_size(temporary.path()), 0U);
+    EXPECT_EQ(localvault::test::read_all_bytes(wal_path), wal_before);
     EXPECT_EQ(directory_entry_names(temporary.root()), entries_before);
 }
 
@@ -148,6 +257,59 @@ TEST(Database, ExplicitImmutableReadOnlyCreatesNoFilesForEncodedPath) {
 }
 
 #ifndef _WIN32
+[[nodiscard]] int child_database_lock_probe(const std::filesystem::path& path) {
+    const auto* filename = path.c_str();
+    const pid_t child = ::fork();
+    if (child < 0) {
+        return -1;
+    }
+    if (child == 0) {
+        const int descriptor = ::open(filename, O_RDWR);
+        if (descriptor < 0) {
+            ::_exit(3);
+        }
+        struct flock lock {};
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = 0x40000002; // SQLite's SHARED_FIRST byte.
+        lock.l_len = 510;         // SQLite's SHARED_SIZE range.
+        const int result = ::fcntl(descriptor, F_SETLK, &lock);
+        ::_exit(result == 0 ? 1 : (errno == EACCES || errno == EAGAIN ? 0 : 2));
+    }
+    int status = 0;
+    pid_t waited = 0;
+    do {
+        waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+TEST(Database, LockedReadOnlyClosePreservesNativeDatabaseLocksAcrossProcesses) {
+    TemporaryDatabase temporary;
+    localvault::Database writable(temporary.path());
+    writable.execute("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    writable.execute("INSERT INTO item (id) VALUES (42)");
+    auto lock = localvault::RepositoryLock::acquire_exclusive(temporary.root() / "repository.lock");
+    // Do not open/read/close this DB through std::ifstream here: POSIX close would
+    // itself release this process's fcntl locks and invalidate the regression.
+    ASSERT_EQ(child_database_lock_probe(temporary.path()), 0);
+    {
+        localvault::Database reader(temporary.path(), localvault::DatabaseAccess::locked_read_only);
+        EXPECT_EQ(scalar_int(reader, "SELECT id FROM item"), 42);
+        EXPECT_EQ(child_database_lock_probe(temporary.path()), 0);
+    }
+    EXPECT_EQ(child_database_lock_probe(temporary.path()), 0);
+    EXPECT_THROW(
+        {
+            localvault::Database reader(temporary.path(),
+                                       localvault::DatabaseAccess::locked_read_only);
+            EXPECT_EQ(scalar_int(reader, "SELECT id FROM item"), 42);
+            throw std::runtime_error("injected reader failure");
+        },
+        std::runtime_error);
+    EXPECT_EQ(child_database_lock_probe(temporary.path()), 0);
+}
+
 TEST(Database, ReadOnlyConnectionWorksWithoutWritePermissions) {
     TemporaryDatabase temporary;
     {

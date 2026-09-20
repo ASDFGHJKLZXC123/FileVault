@@ -7,7 +7,8 @@ namespace localvault {
 
 class RepositoryLock final {
   public:
-    static RepositoryLock acquire_exclusive(const std::filesystem::path& lock_file);
+    static RepositoryLock acquire_exclusive(const std::filesystem::path& lock_file,
+                                            bool write_owner_diagnostics = true);
 
     ~RepositoryLock();
     RepositoryLock(RepositoryLock&&) noexcept;

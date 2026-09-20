@@ -24,15 +24,16 @@
 
 namespace localvault {
 
-class QueryService final {
+class RepositoryTestAccess final {
   public:
     [[nodiscard]] static std::shared_ptr<FailureInjector>
     failure_injector(const Repository& repository) noexcept {
         return repository.failure_injector();
     }
 
-    static void recover_after_writer_lock(Repository& repository) {
-        repository.recover_after_writer_lock();
+    static void recover_after_writer_lock(Repository& repository, bool force = false,
+                                          std::stop_token token = {}) {
+        repository.recover_after_writer_lock(force, token);
     }
 
     static void set_recovery_entry_batch_limit(Repository& repository,
@@ -50,6 +51,7 @@ static_assert(all_failure_points == std::array{
                                         FailurePoint::before_metadata_batch_commit,
                                         FailurePoint::before_snapshot_publish,
                                         FailurePoint::during_restore_write,
+                                        FailurePoint::after_gc_object_delete,
                                     });
 
 class RecordingFailureInjector final : public FailureInjector {
@@ -74,6 +76,21 @@ class ThrowOnOccurrenceInjector final : public FailureInjector {
   private:
     std::size_t occurrence_{};
     std::size_t hits_{};
+};
+
+class CancelOnRecoveryBatch final : public FailureInjector {
+  public:
+    explicit CancelOnRecoveryBatch(std::stop_source& source) : source_(source) {}
+
+    void hit(FailurePoint point) override {
+        if (point == FailurePoint::before_metadata_batch_commit && ++hits_ == 2) {
+            source_.request_stop();
+        }
+    }
+
+  private:
+    std::stop_source& source_;
+    unsigned hits_{};
 };
 
 class TemporaryDirectory final {
@@ -197,7 +214,7 @@ TEST(RepositoryTest, FailureInjectorDefaultsToNoopAndNullRestoresIt) {
     Repository repository = Repository::open(root, OpenMode::read_write);
 
     const std::shared_ptr<FailureInjector> default_injector =
-        QueryService::failure_injector(repository);
+        RepositoryTestAccess::failure_injector(repository);
     ASSERT_NE(default_injector, nullptr);
     for (const FailurePoint point : all_failure_points) {
         EXPECT_NO_THROW(default_injector->hit(point));
@@ -206,7 +223,7 @@ TEST(RepositoryTest, FailureInjectorDefaultsToNoopAndNullRestoresIt) {
     const auto recording_injector = std::make_shared<RecordingFailureInjector>();
     repository.set_failure_injector(recording_injector);
     const std::shared_ptr<FailureInjector> installed_injector =
-        QueryService::failure_injector(repository);
+        RepositoryTestAccess::failure_injector(repository);
     ASSERT_EQ(installed_injector, recording_injector);
     for (const FailurePoint point : all_failure_points) {
         installed_injector->hit(point);
@@ -216,7 +233,7 @@ TEST(RepositoryTest, FailureInjectorDefaultsToNoopAndNullRestoresIt) {
 
     repository.set_failure_injector(nullptr);
     const std::shared_ptr<FailureInjector> restored_injector =
-        QueryService::failure_injector(repository);
+        RepositoryTestAccess::failure_injector(repository);
     ASSERT_NE(restored_injector, nullptr);
     EXPECT_EQ(restored_injector, default_injector);
     EXPECT_NO_THROW(restored_injector->hit(FailurePoint::before_snapshot_publish));
@@ -354,11 +371,11 @@ TEST(RepositoryTest, InterruptedDeletingRecoveryRetriesAndFinishesOnTheSameOpenR
     }
 
     Repository repository = Repository::open(root, OpenMode::read_write);
-    QueryService::set_recovery_entry_batch_limit(repository, 1);
+    RepositoryTestAccess::set_recovery_entry_batch_limit(repository, 1);
     repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(2));
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(QueryService::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
         (void)writer_lock;
     }
     {
@@ -373,7 +390,7 @@ TEST(RepositoryTest, InterruptedDeletingRecoveryRetriesAndFinishesOnTheSameOpenR
     repository.set_failure_injector(nullptr);
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_NO_THROW(QueryService::recover_after_writer_lock(repository));
+        EXPECT_NO_THROW(RepositoryTestAccess::recover_after_writer_lock(repository));
         (void)writer_lock;
     }
     Database database(root / "repository.db");
@@ -381,6 +398,68 @@ TEST(RepositoryTest, InterruptedDeletingRecoveryRetriesAndFinishesOnTheSameOpenR
     remaining.bind(":id", deleting);
     ASSERT_TRUE(remaining.step());
     EXPECT_EQ(remaining.column_int64(0), 0);
+}
+
+TEST(RepositoryTest, CancelledForcedRecoveryStopsBetweenBatchesAndRetainsCompleteSnapshot) {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path() / "repository";
+    const auto source = temporary.path() / "source";
+    std::filesystem::create_directory(source);
+    std::ofstream(source / "file.txt") << "retained complete snapshot payload";
+    Repository::create(root);
+    Repository repository = Repository::open(root);
+    const auto complete = SnapshotEngine(repository).create_snapshot(source, {}).snapshot_id;
+    SnapshotId deleting{};
+    {
+        Database database(root / "repository.db");
+        deleting = insert_snapshot(database, "deleting", 1);
+        insert_directory_entries(database, deleting, 3);
+    }
+    const auto stale_temporary = root / "temporary" / "objects" / "stale.tmp";
+    std::ofstream(stale_temporary) << "stale";
+    RepositoryTestAccess::set_recovery_entry_batch_limit(repository, 1);
+    std::stop_source stop;
+    repository.set_failure_injector(std::make_shared<CancelOnRecoveryBatch>(stop));
+    {
+        const auto lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
+        try {
+            RepositoryTestAccess::recover_after_writer_lock(repository, true, stop.get_token());
+            FAIL() << "recovery should stop at the cancellation boundary";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::cancelled);
+        }
+    }
+    {
+        Database database(root / "repository.db");
+        EXPECT_EQ(entry_count(database, deleting), 2);
+        auto status = database.statement("SELECT status FROM snapshots WHERE id = :id");
+        status.bind(":id", deleting);
+        ASSERT_TRUE(status.step());
+        EXPECT_EQ(status.column_text(0), "deleting");
+    }
+    EXPECT_TRUE(std::filesystem::exists(stale_temporary));
+
+    repository.set_failure_injector(nullptr);
+    {
+        const auto lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
+        EXPECT_NO_THROW(RepositoryTestAccess::recover_after_writer_lock(repository, true));
+    }
+    EXPECT_FALSE(std::filesystem::exists(stale_temporary));
+    {
+        Database database(root / "repository.db");
+        auto remaining = database.statement("SELECT COUNT(*) FROM snapshots WHERE id = :id");
+        remaining.bind(":id", deleting);
+        ASSERT_TRUE(remaining.step());
+        EXPECT_EQ(remaining.column_int64(0), 0);
+    }
+    RestoreRequest request;
+    request.snapshot_id = complete;
+    request.destination_root = std::filesystem::canonical(temporary.path()) / "restored";
+    EXPECT_EQ(RestoreEngine(repository).restore(request).restored_files, 1U);
+    std::ifstream restored(request.destination_root / "file.txt");
+    std::string contents;
+    std::getline(restored, contents);
+    EXPECT_EQ(contents, "retained complete snapshot payload");
 }
 
 TEST(RepositoryTest, InterruptedPendingCleanupRetriesWithoutLosingFailureInformation) {
@@ -395,11 +474,11 @@ TEST(RepositoryTest, InterruptedPendingCleanupRetriesWithoutLosingFailureInforma
     }
 
     Repository repository = Repository::open(root, OpenMode::read_write);
-    QueryService::set_recovery_entry_batch_limit(repository, 1);
+    RepositoryTestAccess::set_recovery_entry_batch_limit(repository, 1);
     repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(3));
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(QueryService::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
         (void)writer_lock;
     }
     {
@@ -416,7 +495,7 @@ TEST(RepositoryTest, InterruptedPendingCleanupRetriesWithoutLosingFailureInforma
     repository.set_failure_injector(nullptr);
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_NO_THROW(QueryService::recover_after_writer_lock(repository));
+        EXPECT_NO_THROW(RepositoryTestAccess::recover_after_writer_lock(repository));
         (void)writer_lock;
     }
     Database database(root / "repository.db");
@@ -440,10 +519,10 @@ TEST(RepositoryTest, InterruptedWarningCleanupFinishesAfterRepositoryReopen) {
 
     {
         Repository repository = Repository::open(root, OpenMode::read_write);
-        QueryService::set_recovery_entry_batch_limit(repository, 1);
+        RepositoryTestAccess::set_recovery_entry_batch_limit(repository, 1);
         repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(4));
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(QueryService::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
     }
     {
         Database database(root / "repository.db");
@@ -462,9 +541,9 @@ TEST(RepositoryTest, InterruptedWarningCleanupFinishesAfterRepositoryReopen) {
 
     {
         Repository reopened = Repository::open(root, OpenMode::read_write);
-        QueryService::set_recovery_entry_batch_limit(reopened, 1);
+        RepositoryTestAccess::set_recovery_entry_batch_limit(reopened, 1);
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_NO_THROW(QueryService::recover_after_writer_lock(reopened));
+        EXPECT_NO_THROW(RepositoryTestAccess::recover_after_writer_lock(reopened));
     }
     Database database(root / "repository.db");
     auto recovered = database.statement(

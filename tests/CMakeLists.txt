@@ -1,6 +1,10 @@
 add_executable(
     localvault_tests
     integration/lock_contention_test.cpp
+    integration/diff_engine_test.cpp
+    integration/garbage_collector_test.cpp
+    integration/integrity_verifier_test.cpp
+    integration/query_service_test.cpp
     integration/m4_crash_safety_test.cpp
     integration/m3_large_file_roundtrip_test.cpp
     integration/m5_pipeline_test.cpp
