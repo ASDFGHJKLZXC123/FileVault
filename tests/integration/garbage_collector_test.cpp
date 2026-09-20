@@ -125,7 +125,7 @@ TEST_F(GarbageCollectorTest, DeleteThenGcPreservesSharedChunksAndRestoresOlderSn
     EXPECT_EQ(scalar("SELECT COUNT(*) FROM chunks"), 1);
     RestoreRequest request;
     request.snapshot_id = older;
-    request.destination_root = temporary.path() / "restored";
+    request.destination_root = std::filesystem::canonical(temporary.path()) / "restored";
     const auto restored = RestoreEngine(*repository).restore(request);
     EXPECT_EQ(restored.restored_files, 2U);
     test::expect_file_bytes_equal(source / "shared.txt", request.destination_root / "shared.txt");

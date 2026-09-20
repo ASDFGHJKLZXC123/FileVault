@@ -40,11 +40,24 @@ Runtime evidence below was produced by the root agent and inspected from its log
   snapshot; `M4CrashSafety.ActualSnapshotRestoreAndDeletingLifecycleHitsEveryFailurePoint`
   now collects after deletion and still requires every failure seam. This verifier
   inspected the extensions and the successful final log; the matrix was not weakened.
+- Subsequent fixture-only portability adjustment: the GC-after-delete restore test
+  canonicalizes its existing temporary parent before appending `restored`, avoiding
+  an incidental macOS `/var` alias in the destination's ancestor chain. This verifier
+  inspected the one-line diff; production code and byte-comparison assertions are
+  unchanged. Root reports the warning-strict rebuild passes, and the inspected
+  `build/m5-junction/m6-canonical-restore-test.log` records the affected acceptance
+  test passing, 1/1, 0 failures, 0.30 seconds. The full-suite run above remains the
+  production baseline; final CI must include this fixture adjustment.
 - Formatting: root reports `clang-format --dry-run --Werror` passes on all
   14 new C++ files. This verifier did not independently rerun formatting.
 - CI: pending. No final implementation SHA/run URL with successful Linux, macOS,
   Windows, Linux ASan/UBSan, and Linux TSan jobs has yet been supplied. No previous
   milestone's run is counted as M6 evidence.
+- Root CI supplement: initial implementation `f71290281ed128b409b0dd7aef1dbfc0c4ecbd68`
+  in [run 35544208683](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544208683)
+  passed Linux and TSan. macOS built successfully and failed only the temporary-parent
+  alias fixture described above; both POSIX root-redirection and native-lock-preservation
+  tests passed there and on Linux. The corrected fixture must pass a new complete CI run.
 
 ## Independent source conclusions
 
