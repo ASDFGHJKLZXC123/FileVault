@@ -1,8 +1,9 @@
 # M6 independent verification
 
-Date: 2026-09-20. Status: 18 of 19 checklist items satisfied. Implementation,
-focused acceptance tests, and the native full suite pass; milestone closure is
-pending all five CI jobs on the final implementation commit.
+Date: 2026-09-20. Status: **19 of 19 checklist items satisfied**. Implementation,
+focused acceptance tests, the native full suite, and all five CI jobs pass.
+Final CI evidence below was appended by the root orchestrator; the independent
+source review and local-evidence verification above it retain their original authorship.
 
 This verifier independently read `AGENTS.md`, the M6 milestone and its required
 sections in plan parts 04–07, 09, and 11, the implementation decision record,
@@ -12,7 +13,7 @@ implementation/test edits and no competing build or test process. Available inhe
 agents were used because the orchestrator's named model routes were unavailable.
 Runtime evidence below was produced by the root agent and inspected from its logs.
 
-## Execution evidence and open gates
+## Execution evidence
 
 - Actual local host: Windows 11, MSVC 19.44, Visual Studio 2022 generator,
   Debug, CMake 4.3.3, pinned vcpkg manifest. The existing isolated build is
@@ -29,7 +30,7 @@ Runtime evidence below was produced by the root agent and inspected from its log
   `IntegrityVerifierTest.DirectoryIndirectionIsNotTraversed`, and
   `IntegrityVerifierTest.ReferencedObjectIndirectionIsFatalWithoutReadingTarget`.
   POSIX-only root-redirection and native-lock preservation tests are not registered
-  on Windows. Their execution evidence must come from Linux/macOS CI.
+  on Windows. Both passed on Linux, macOS, and Linux ASan/UBSan CI.
 - Final full run: `build/m5-junction/m6-full-tests.log`, 246 registered,
   235 passed, 11 skipped, 0 failed, 56.67 seconds. Ten skips require unavailable
   symlink privilege; the other is the opt-in external M3 large-file dataset.
@@ -50,14 +51,27 @@ Runtime evidence below was produced by the root agent and inspected from its log
   production baseline; final CI must include this fixture adjustment.
 - Formatting: root reports `clang-format --dry-run --Werror` passes on all
   14 new C++ files. This verifier did not independently rerun formatting.
-- CI: pending. No final implementation SHA/run URL with successful Linux, macOS,
-  Windows, Linux ASan/UBSan, and Linux TSan jobs has yet been supplied. No previous
-  milestone's run is counted as M6 evidence.
+- Final implementation CI: `970df1a4dfa5554be6065936705e464ca3354fc8`,
+  [run 35544431396](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396).
+  All five jobs succeeded. No previous milestone's run is counted as M6 evidence.
+
+  | Job | Result and executed-suite evidence |
+  |---|---|
+  | [Linux](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396/job/106167724452) | 251 passed, 1 opt-in dataset skip; 6.89 s |
+  | [macOS](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396/job/106167724390) | 251 passed, 1 opt-in dataset skip; manual M5 benchmark disabled; 23.57 s |
+  | [Windows](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396/job/106167724396) | 245 passed, 1 opt-in dataset skip; 34.70 s; symlink tests ran successfully |
+  | [Linux ASan/UBSan](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396/job/106167724415) | 251 passed, 1 opt-in dataset skip; 24.22 s; no sanitizer failure |
+  | [Linux TSan](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544431396/job/106167724314) | Existing 19-test concurrency filter passed; 2.98 s; no sanitizer failure |
+
+  Root inspected job conclusions and logs, including the shared-chunk restore,
+  zero-write preview, POSIX root-redirection, and native database-lock regressions.
+  The final documentation-only closure is pushed separately and its CI is checked
+  before announcing branch finalization; no implementation changes follow this run.
 - Root CI supplement: initial implementation `f71290281ed128b409b0dd7aef1dbfc0c4ecbd68`
   in [run 35544208683](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/35544208683)
   passed Linux and TSan. macOS built successfully and failed only the temporary-parent
   alias fixture described above; both POSIX root-redirection and native-lock-preservation
-  tests passed there and on Linux. The corrected fixture must pass a new complete CI run.
+  tests passed there and on Linux. The corrected fixture passed the complete run above.
 
 ## Independent source conclusions
 
@@ -208,8 +222,9 @@ platform gate remains open and therefore M6 is not yet complete.
 
 **Platform & CI**
 
-- [ ] Active native development host suite green; Linux, macOS, Windows, Linux ASan/UBSan, and Linux TSan CI jobs green. Record the actual local host; do not claim an unavailable Mac-local run. No VM session required (optionally verify a VM-created repository for a free portability point).
-  Native full suite passes. Pending CI run bound to the final implementation SHA.
+- [x] Active native development host suite green; Linux, macOS, Windows, Linux ASan/UBSan, and Linux TSan CI jobs green. Record the actual local host; do not claim an unavailable Mac-local run. No VM session required (optionally verify a VM-created repository for a free portability point).
+  Native Windows full suite passes. All five jobs pass in run 35544431396 for
+  `970df1a4dfa5554be6065936705e464ca3354fc8`; job links and runtime evidence are above.
   Windows host and exact skip scope are recorded above.
 
 **Process**
@@ -238,7 +253,7 @@ All listed tests passed in the focused Windows run unless explicitly marked POSI
 | FR-404 — invalid relationships | `IntegrityVerifierTest.ForeignKeyAndMissingChunkRowsAreReported`, `InvalidChunkSequenceOffsetAndTotalsAreReported`. |
 | FR-405 — transactional deletion | `GarbageCollectorTest.CancelledDeletionRemainsResumableAndRetainsObjects`, `RejectsPendingAndMissingSnapshotsWithoutPublishingDeletion`; existing `RepositoryTest.InterruptedDeletingRecoveryRetriesAndFinishesOnTheSameOpenRepository`. |
 | FR-406 — preview GC | `GarbageCollectorTest.PreviewLeavesEntireRepositoryAndDatabaseByteIdentical`, `PreviewPredictsOrphansAfterStaleReferencesAreRecovered`; `Database.LockedReadOnlyReadsLiveWalWithoutChangingAnyDatabaseFile`. |
-| FR-407 — collect only unreferenced objects | `GarbageCollectorTest.DeleteThenGcPreservesSharedChunksAndRestoresOlderSnapshot`, `InterruptedObjectDeletionLeavesRecoverableUnreferencedRow`, `InvalidStoredPathCannotDeleteOutsideRepository`, `IgnoresNonCanonicalOrphanNamesAndRetainsLiveObjects`. Additional pending POSIX evidence: `RejectsRepositoryRootRedirectedAfterOpen`, `Database.LockedReadOnlyClosePreservesNativeDatabaseLocksAcrossProcesses`. |
+| FR-407 — collect only unreferenced objects | `GarbageCollectorTest.DeleteThenGcPreservesSharedChunksAndRestoresOlderSnapshot`, `InterruptedObjectDeletionLeavesRecoverableUnreferencedRow`, `InvalidStoredPathCannotDeleteOutsideRepository`, `IgnoresNonCanonicalOrphanNamesAndRetainsLiveObjects`. Additional passing POSIX CI evidence: `RejectsRepositoryRootRedirectedAfterOpen`, `Database.LockedReadOnlyClosePreservesNativeDatabaseLocksAcrossProcesses`. |
 | FR-408 — stale cleanup | `GarbageCollectorTest.PreviewPredictsRecoveryWithoutChangingStaleReferences`, `PreviewLeavesEntireRepositoryAndDatabaseByteIdentical`, `PreviewPredictsOrphansAfterStaleReferencesAreRecovered`; `RepositoryTest.CancelledForcedRecoveryStopsBetweenBatchesAndRetainsCompleteSnapshot`. |
 
 Within a table cell, unqualified test names keep the preceding suite prefix.
