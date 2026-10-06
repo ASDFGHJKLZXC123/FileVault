@@ -52,3 +52,5 @@ Status: implementation, critical review, native acceptance, and human check comp
   retain the no-stdout assertion that distinguishes immediate exit from cancellation.
 - GCC/glibc annotate `fclose`; using its function-pointer type as a template argument
   fails warning-strict builds. Use a lambda deleter for the output spool's same RAII lifetime.
+- POSIX interrupts restart blocked writes: otherwise the second SIGINT can interrupt
+  diagnostics with EINTR and allow graceful JSON before the force-exit monitor runs.

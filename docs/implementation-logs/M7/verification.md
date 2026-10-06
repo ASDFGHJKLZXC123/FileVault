@@ -257,7 +257,16 @@ configuration.
   remaining pipe capacity with single-byte writes; forced-exit assertions remain.
   Native pipe saturation probes confirm that no single byte fits after bulk/tail
   filling, including when the pipe starts with a seeded partial write.
-- The same run's Linux and TSan jobs failed compilation at `src/cli/output.cpp:131`:
+- Further source review identified a second mechanism behind that macOS result:
+  SIGINT was installed without `SA_RESTART`, so the second signal could interrupt
+  the blocked stderr write with EINTR. A failed stream can then allow graceful JSON
+  and monitor destruction before its next poll. This is inferred from the source
+  and observed alive-before-second-signal / JSON-after-second-signal sequence;
+  the log does not directly capture errno. Added `SA_RESTART` to keep diagnostic
+  writes blocked until the monitor forces exit. Signal handlers remain flag-only;
+  cooperative input cancellation retains its bounded 10 ms polling. The pipe
+  saturation repair is retained. All signal cases require new CI validation.
+- The same run's Linux, ASan/UBSan, and TSan jobs failed compilation at `src/cli/output.cpp:131`:
   GCC emitted `-Werror=ignored-attributes` for `decltype(&std::fclose)` as a
   `unique_ptr` deleter. Replaced it with a lambda deleter retaining the same
   close-on-destruction behavior. No tests ran on those failed builds.
@@ -266,3 +275,17 @@ configuration.
   passed 264 of 265 registered CTest entries, with only the opt-in external dataset
   skipped; 47.83 seconds. All 14 CLI cases passed with zero skips (10.131 seconds).
   Final acceptance still requires the fully corrected implementation revision.
+
+## Corrected implementation CI — root evidence
+
+Revision `0b2dfaa5f198f3123703d1d16d2508ff490bb579`,
+[run 37420211705](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/37420211705).
+Remaining jobs are running; M7 acceptance remains open.
+
+| Job | Executed result |
+|---|---|
+| [Windows](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/37420211705/job/112127655188) | Passed: 264 tests, one opt-in external-dataset skip, 265 registered; 49.17 s. All 14 CLI cases passed, zero skips; 10.328 s. |
+
+Windows log: `build/m7-ci/37420211705-windows.log`. The updated forced-interrupt
+case, permission-denied source, warning pagination, and every CLI command ran.
+GoogleTest prefetch was SHA512-verified; the vcpkg binary cache restored successfully.

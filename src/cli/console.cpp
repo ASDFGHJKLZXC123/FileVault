@@ -144,6 +144,7 @@ struct InterruptHandler::Impl {
 #else
         struct sigaction action{};
         action.sa_handler = on_interrupt;
+        action.sa_flags = SA_RESTART;
         sigemptyset(&action.sa_mask);
         const bool installed = sigaction(SIGINT, &action, &previous) == 0;
 #endif
