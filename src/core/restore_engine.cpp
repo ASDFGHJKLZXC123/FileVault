@@ -639,7 +639,9 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
             }
             output.write(raw);
             failure_injector->hit(FailurePoint::during_restore_write);
-            full_file_hasher.update(raw);
+            if (request.verify_final_file_hash) {
+                full_file_hasher.update(raw);
+            }
             written = checked_add(written, chunk.raw_length, entry.relative_path);
         }
         if (written != entry.logical_size) {
@@ -647,7 +649,8 @@ RestoreResult RestoreEngine::restore(const RestoreRequest& request, std::stop_to
                                   "restored file size does not match snapshot metadata",
                                   entry.relative_path);
         }
-        if (Blake3Hasher::to_hex(full_file_hasher.finalize()) != *entry.file_hash_hex) {
+        if (request.verify_final_file_hash &&
+            Blake3Hasher::to_hex(full_file_hasher.finalize()) != *entry.file_hash_hex) {
             throw LocalVaultError(ErrorCode::object_corrupt,
                                   "restored file failed full-file BLAKE3 verification",
                                   entry.relative_path);

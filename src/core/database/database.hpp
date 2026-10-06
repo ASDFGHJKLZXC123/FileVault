@@ -14,7 +14,7 @@ enum class DatabaseAccess {
     read_only,
     immutable_read_only,
     // WAL-aware, zero-write view. Caller must hold the exclusive repository OS lock
-    // and retain a normal SQLite connection to this database for the view's lifetime.
+    // through the view's destruction. Native SQLite shared locks protect WAL lifetime.
     locked_read_only,
 };
 

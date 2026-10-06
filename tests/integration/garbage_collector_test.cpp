@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <sqlite3.h>
 
 #include <filesystem>
 #include <fstream>
@@ -154,6 +155,53 @@ TEST_F(GarbageCollectorTest, PreviewLeavesEntireRepositoryAndDatabaseByteIdentic
     EXPECT_FALSE(std::filesystem::exists(orphan_path));
     EXPECT_FALSE(std::filesystem::exists(root / "temporary/objects/stale.tmp"));
     EXPECT_EQ(scalar("SELECT COUNT(*) FROM chunks"), 0);
+}
+
+TEST_F(GarbageCollectorTest, ClosedSidecarFreeMaintenancePreviewIsByteIdenticalAndCannotExecute) {
+    const auto orphan_path = orphan();
+    repository.reset();
+    {
+        Database database(root / "repository.db");
+        auto checkpoint = database.statement("PRAGMA wal_checkpoint(TRUNCATE)");
+        ASSERT_TRUE(checkpoint.step());
+        ASSERT_EQ(checkpoint.column_int64(0), 0);
+        ASSERT_FALSE(checkpoint.step());
+    }
+    std::filesystem::remove(root / "repository.db-wal");
+    std::filesystem::remove(root / "repository.db-shm");
+    const auto before = capture_tree(root);
+    {
+        auto maintenance = Repository::open(root, OpenMode::maintenance_read_only);
+        GarbageCollector gc(maintenance);
+        const auto preview = gc.collect();
+        EXPECT_EQ(preview.orphan_objects, 1U);
+        EXPECT_EQ(preview.reclaimable_bytes, std::filesystem::file_size(orphan_path));
+        EXPECT_THROW((void)gc.collect({.dry_run = false}), LocalVaultError);
+        EXPECT_THROW(gc.delete_snapshot(1), LocalVaultError);
+    }
+    EXPECT_EQ(capture_tree(root), before);
+    EXPECT_FALSE(std::filesystem::exists(root / "repository.db-wal"));
+    EXPECT_FALSE(std::filesystem::exists(root / "repository.db-shm"));
+}
+
+TEST_F(GarbageCollectorTest, StandaloneMaintenancePreviewReadsLiveWalWithoutChangingAnyBytes) {
+    repository.reset();
+    {
+        Database writer(root / "repository.db");
+        int enabled{};
+        ASSERT_EQ(sqlite3_db_config(writer.handle(), SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &enabled),
+                  SQLITE_OK);
+        writer.execute("INSERT INTO snapshots(created_at_ns, source_root, status) "
+                       "VALUES(0, '/source', 'pending')");
+    }
+    ASSERT_GT(std::filesystem::file_size(root / "repository.db-wal"), 0U);
+    const auto before = capture_tree(root);
+    {
+        auto maintenance = Repository::open(root, OpenMode::maintenance_read_only);
+        const auto preview = GarbageCollector(maintenance).collect();
+        EXPECT_EQ(preview.stale_snapshots, 1U);
+    }
+    EXPECT_EQ(capture_tree(root), before);
 }
 
 TEST_F(GarbageCollectorTest, PreviewPredictsRecoveryWithoutChangingStaleReferences) {

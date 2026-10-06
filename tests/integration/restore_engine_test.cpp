@@ -496,8 +496,7 @@ TEST_F(RestoreEngineTest, TruncatedObjectCannotReplaceExistingDestination) {
     EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
 }
 
-TEST_F(RestoreEngineTest,
-       MissingInvalidAndWrongFileHashesFailEvenWhenFinalVerificationFlagIsFalse) {
+TEST_F(RestoreEngineTest, MissingInvalidAndWrongFileHashesFailWithFinalVerification) {
     const std::filesystem::path source = temporary_.path() / "source-file-hash";
     test::DatasetBuilder(source).text_file("file.txt", "snapshot bytes");
     const SnapshotId snapshot_id = snapshot(source);
@@ -531,13 +530,46 @@ TEST_F(RestoreEngineTest,
                           .destination_root = destination,
                           .overwrite_policy = OverwritePolicy::always,
                           .conflict_resolver = {},
-                          .verify_final_file_hash = false});
+                          .verify_final_file_hash = true});
             FAIL() << "corrupt full-file hash unexpectedly restored";
         } catch (const LocalVaultError& error) {
             EXPECT_EQ(error.code(), ErrorCode::object_corrupt);
         }
         EXPECT_EQ(read_text(destination / "file.txt"), "existing bytes");
     }
+}
+
+TEST_F(RestoreEngineTest, ExplicitNoFinalHashRetainsMetadataAndChunkValidation) {
+    const auto source = temporary_.path() / "source-no-final-hash";
+    test::DatasetBuilder(source).text_file("file.txt", "snapshot bytes");
+    const auto id = snapshot(source);
+    Database database(repository_root() / "repository.db");
+    const auto set_hash = [&](std::string_view hash) {
+        auto update = database.statement(
+            "UPDATE entries SET file_hash=:hash WHERE snapshot_id=:id AND entry_type='file'");
+        update.bind(":hash", hash);
+        update.bind(":id", id);
+        update.execute();
+    };
+    const auto destination = destination_path("no-final-hash");
+    const RestoreRequest request{.snapshot_id = id,
+                                 .relative_paths = {},
+                                 .destination_root = destination,
+                                 .overwrite_policy = OverwritePolicy::always,
+                                 .conflict_resolver = {},
+                                 .verify_final_file_hash = false};
+    set_hash("invalid");
+    EXPECT_THROW((void)RestoreEngine(*repository_).restore(request), LocalVaultError);
+    EXPECT_FALSE(std::filesystem::exists(destination / "file.txt"));
+    set_hash(std::string(64, '0'));
+    EXPECT_EQ(RestoreEngine(*repository_).restore(request).restored_files, 1U);
+    EXPECT_EQ(read_text(destination / "file.txt"), "snapshot bytes");
+    auto query = database.statement("SELECT object_path FROM chunks LIMIT 1");
+    ASSERT_TRUE(query.step());
+    const auto object_path = repository_root() / query.column_text(0);
+    write_bytes(object_path, {});
+    EXPECT_THROW((void)RestoreEngine(*repository_).restore(request), LocalVaultError);
+    EXPECT_EQ(read_text(destination / "file.txt"), "snapshot bytes");
 }
 
 TEST_F(RestoreEngineTest, RejectsMalformedChunkLayoutsBeforePublication) {

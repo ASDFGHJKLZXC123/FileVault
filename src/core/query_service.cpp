@@ -1,6 +1,7 @@
 #include "localvault/query_service.hpp"
 
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -154,6 +155,44 @@ void bind_page(Statement& statement, PageRequest page) {
                : 1.0 - static_cast<double>(numerator) / static_cast<double>(denominator);
 }
 
+[[nodiscard]] RepositoryStats read_statistics(Database& database,
+                                              std::optional<SnapshotId> snapshot_id = {}) {
+    const std::string selection = "FROM snapshots AS s WHERE s.status = 'complete'" +
+                                  std::string(snapshot_id ? " AND s.id = :snapshot_id" : "");
+    const auto bind_snapshot = [&](Statement& statement) {
+        if (snapshot_id) {
+            statement.bind(":snapshot_id", *snapshot_id);
+        }
+    };
+    RepositoryStats result;
+    auto count = database.statement("SELECT COUNT(*) " + selection);
+    bind_snapshot(count);
+    result.complete_snapshot_count = read_count(count);
+    const std::string retained_entries =
+        "FROM entries AS e WHERE e.snapshot_id IN (SELECT s.id " + selection + ")";
+    auto entries = database.statement("SELECT e.logical_size " + retained_entries +
+                                      " AND e.entry_type = 'file'");
+    bind_snapshot(entries);
+    while (entries.step()) {
+        add_checked(result.logical_bytes, entries.column_int64(0));
+    }
+    auto chunks =
+        database.statement("SELECT raw_size, compressed_size FROM chunks WHERE hash IN ("
+                           "SELECT ec.chunk_hash FROM entry_chunks AS ec WHERE ec.entry_id IN ("
+                           "SELECT e.id " +
+                           retained_entries + "))");
+    bind_snapshot(chunks);
+    while (chunks.step()) {
+        add_checked(result.unique_chunk_count, 1);
+        add_checked(result.unique_raw_bytes, chunks.column_int64(0));
+        add_checked(result.stored_bytes, chunks.column_int64(1));
+    }
+    result.deduplication_savings = savings(result.unique_raw_bytes, result.logical_bytes);
+    result.compression_savings = savings(result.stored_bytes, result.unique_raw_bytes);
+    result.total_savings = savings(result.stored_bytes, result.logical_bytes);
+    return result;
+}
+
 } // namespace
 
 QueryService::QueryService(Repository& repository) : repository_(repository) {}
@@ -211,30 +250,43 @@ Page<EntryInfo> QueryService::search_paths(SnapshotId id, std::string_view query
     return entry_page(repository_.database(), id, "instr(relative_path, :value) > 0", query, page);
 }
 
+Page<SnapshotWarning> QueryService::list_warnings(SnapshotId id, PageRequest page) const {
+    validate_page(page);
+    auto& database = repository_.database();
+    Transaction transaction(database);
+    (void)MetadataStore(database).require_complete_snapshot(id);
+    auto count = database.statement(
+        "SELECT COUNT(*) FROM snapshot_warnings WHERE snapshot_id = :snapshot_id");
+    count.bind(":snapshot_id", id);
+    Page<SnapshotWarning> result;
+    result.total_count = read_count(count);
+    auto warnings = database.statement(
+        "SELECT relative_path, warning_code, message FROM snapshot_warnings "
+        "WHERE snapshot_id = :snapshot_id ORDER BY relative_path COLLATE BINARY, "
+        "warning_code COLLATE BINARY, id LIMIT :limit OFFSET :offset");
+    warnings.bind(":snapshot_id", id);
+    bind_page(warnings, page);
+    while (warnings.step()) {
+        result.items.push_back(
+            {utf8_path(warnings.column_text(0)), warnings.column_text(1), warnings.column_text(2)});
+    }
+    transaction.commit();
+    return result;
+}
+
+RepositoryStats QueryService::snapshot_stats(SnapshotId id) const {
+    auto& database = repository_.database();
+    Transaction transaction(database);
+    (void)MetadataStore(database).require_complete_snapshot(id);
+    auto result = read_statistics(database, id);
+    transaction.commit();
+    return result;
+}
+
 RepositoryStats QueryService::repository_stats() const {
     auto& database = repository_.database();
     Transaction transaction(database);
-    RepositoryStats result;
-    auto count = database.statement("SELECT COUNT(*) FROM snapshots WHERE status = 'complete'");
-    result.complete_snapshot_count = read_count(count);
-    auto entries = database.statement(
-        "SELECT e.logical_size FROM entries AS e JOIN snapshots AS s ON s.id = e.snapshot_id "
-        "WHERE s.status = 'complete' AND e.entry_type = 'file'");
-    while (entries.step()) {
-        add_checked(result.logical_bytes, entries.column_int64(0));
-    }
-    auto chunks = database.statement(
-        "SELECT raw_size, compressed_size FROM chunks WHERE hash IN ("
-        "SELECT ec.chunk_hash FROM entry_chunks AS ec JOIN entries AS e ON e.id = ec.entry_id "
-        "JOIN snapshots AS s ON s.id = e.snapshot_id WHERE s.status = 'complete')");
-    while (chunks.step()) {
-        add_checked(result.unique_chunk_count, 1);
-        add_checked(result.unique_raw_bytes, chunks.column_int64(0));
-        add_checked(result.stored_bytes, chunks.column_int64(1));
-    }
-    result.deduplication_savings = savings(result.unique_raw_bytes, result.logical_bytes);
-    result.compression_savings = savings(result.stored_bytes, result.unique_raw_bytes);
-    result.total_savings = savings(result.stored_bytes, result.logical_bytes);
+    auto result = read_statistics(database);
     transaction.commit();
     return result;
 }

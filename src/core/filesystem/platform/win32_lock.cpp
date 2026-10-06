@@ -80,10 +80,10 @@ RepositoryLock::RepositoryLock(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 
 RepositoryLock RepositoryLock::acquire_exclusive(const std::filesystem::path& lock_file,
                                                  bool write_owner_diagnostics) {
-    const HANDLE handle = ::CreateFileW(lock_file.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                        write_owner_diagnostics ? OPEN_ALWAYS : OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD access = GENERIC_READ | (write_owner_diagnostics ? GENERIC_WRITE : 0);
+    const HANDLE handle = ::CreateFileW(
+        lock_file.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        write_owner_diagnostics ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         throw_filesystem_error(lock_file, "failed to open repository lock file", ::GetLastError());
     }

@@ -108,6 +108,11 @@ No relative path means restore the complete snapshot only when `--all` is suppli
 localvault restore 12 --all --repo ./vault --output ./restored
 ```
 
+M7 user decision (2026-10-04): overwrite prompts accept terminal and scripted stdin.
+Answers are `s` (skip), `r` (replace), `sa` (skip all), `ra` (replace all), and `c`
+(cancel). Prompts go to stderr; EOF without an answer is a usage error. Waiting is
+cancellable. `files --path` and `--search` are mutually exclusive.
+
 ### Verify
 
 ```bash
@@ -116,6 +121,9 @@ localvault verify \
   [--quick | --full] \
   [--files]
 ```
+
+`--files` performs whole-file hash verification in the core without writing restored
+files. It implies `--full`; combining it with explicit `--quick` is a usage error.
 
 ### Statistics
 
@@ -171,6 +179,9 @@ JSON mode:
 - Keep progress disabled or emit structured progress to stderr.
 - Do not mix color codes with JSON.
 - Include stable field names and a schema version.
+
+M7 schema v1 uses `{ "schema_version": 1, "command": "...", "result": { ... } }`.
+Fatal errors use `error` in place of `result`, with `code`, `message`, and `path`.
 
 ## 28.5 CLI implementation
 

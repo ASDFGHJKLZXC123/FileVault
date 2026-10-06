@@ -11,6 +11,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "database/database.hpp"
@@ -105,8 +106,9 @@ class IntegrityVerifierTest : public ::testing::Test {
         return paths;
     }
 
-    [[nodiscard]] VerificationResult verify(VerifyMode mode = VerifyMode::quick) {
-        return IntegrityVerifier(*repository_).verify(mode);
+    [[nodiscard]] VerificationResult verify(VerifyMode mode = VerifyMode::quick,
+                                            bool verify_files = false) {
+        return IntegrityVerifier(*repository_).verify(mode, {}, {}, verify_files);
     }
 
     test::TemporaryDirectory temporary_;
@@ -128,6 +130,161 @@ TEST_F(IntegrityVerifierTest, HealthyQuickAndFullCheckDistinctReferencedObjects)
         EXPECT_EQ(result.checked_objects, 2U);
         EXPECT_EQ(result.checked_stored_bytes, bytes);
     }
+}
+
+TEST_F(IntegrityVerifierTest,
+       WholeFileVerificationStreamsMultipleChunksAndEmptyFilesWithoutWrites) {
+    const auto chunked_root = temporary_.path() / "chunked-repository";
+    RepositoryCreateOptions options;
+    options.chunk_size_bytes = 8U;
+    Repository::create(chunked_root, options);
+    auto chunked = Repository::open(chunked_root);
+    const auto chunked_source = temporary_.path() / "chunked-source";
+    test::DatasetBuilder(chunked_source)
+        .text_file("multi.txt", "abcdefghijklmnopqrstu")
+        .text_file("empty.txt", "");
+    (void)SnapshotEngine(chunked).create_snapshot(chunked_source, SnapshotOptions{});
+    const auto before = read_tree(chunked_root);
+    const auto result = IntegrityVerifier(chunked).verify(VerifyMode::full, {}, {}, true);
+    EXPECT_TRUE(result.ok());
+    EXPECT_TRUE(result.issues.empty());
+    EXPECT_EQ(result.checked_objects, 3U);
+    EXPECT_EQ(result.checked_files, 2U);
+    EXPECT_EQ(result.checked_file_bytes, 21U);
+    EXPECT_EQ(read_tree(chunked_root), before);
+}
+
+TEST_F(IntegrityVerifierTest, WholeFileVerificationRejectsQuickMode) {
+    expect_error([&] { (void)verify(VerifyMode::quick, true); }, ErrorCode::invalid_argument);
+    EXPECT_TRUE(verify().ok());
+}
+
+TEST_F(IntegrityVerifierTest, WholeFileHashMismatchIsDetectedWithIntactChunks) {
+    execute("UPDATE entries SET file_hash='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE relative_path='a.txt'");
+    const auto chunks_only = verify(VerifyMode::full);
+    EXPECT_TRUE(chunks_only.ok());
+    EXPECT_EQ(chunks_only.checked_files, 0U);
+    EXPECT_EQ(chunks_only.checked_file_bytes, 0U);
+    const auto before = read_tree(root());
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_FALSE(result.ok());
+    ASSERT_EQ(result.issues.size(), 1U);
+    EXPECT_EQ(result.issues.front().kind, Kind::file_hash_mismatch);
+    EXPECT_EQ(result.issues.front().path, std::filesystem::path("a.txt"));
+    EXPECT_EQ(result.checked_files, 3U);
+    EXPECT_EQ(result.checked_file_bytes, 39U);
+    EXPECT_EQ(read_tree(root()), before);
+}
+
+TEST_F(IntegrityVerifierTest, MissingWholeFileHashDoesNotAbortLaterFileHashChecks) {
+    execute("UPDATE entries SET file_hash=NULL "
+            "WHERE id=(SELECT MIN(id) FROM entries WHERE entry_type='file')");
+    execute("UPDATE entries SET file_hash='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "
+            "WHERE id=(SELECT MAX(id) FROM entries WHERE entry_type='file')");
+    const auto before = read_tree(root());
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_FALSE(result.ok());
+    EXPECT_FALSE(has_issue(result, Kind::invalid_database));
+    EXPECT_EQ(result.checked_files, 3U);
+    EXPECT_EQ(result.checked_file_bytes, 39U);
+    EXPECT_EQ(
+        std::count_if(result.issues.begin(), result.issues.end(),
+                      [](const auto& issue) { return issue.kind == Kind::file_hash_mismatch; }),
+        2);
+    EXPECT_TRUE(std::any_of(result.issues.begin(), result.issues.end(), [](const auto& issue) {
+        return issue.kind == Kind::file_hash_mismatch &&
+               issue.detail == "reconstructed file failed whole-file BLAKE3 verification";
+    }));
+    EXPECT_EQ(read_tree(root()), before);
+}
+
+TEST_F(IntegrityVerifierTest, EmptyWholeFileHashAndIndependentFailuresAreChecked) {
+    test::DatasetBuilder(source()).text_file("empty.txt", "");
+    snapshot();
+    execute("UPDATE entries SET file_hash='wrong' "
+            "WHERE relative_path IN ('a.txt','empty.txt')");
+    const auto before = read_tree(root());
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        std::count_if(result.issues.begin(), result.issues.end(),
+                      [](const auto& issue) { return issue.kind == Kind::file_hash_mismatch; }),
+        3);
+    EXPECT_EQ(result.checked_files, 7U);
+    EXPECT_EQ(result.checked_file_bytes, 78U);
+    EXPECT_EQ(read_tree(root()), before);
+}
+
+TEST_F(IntegrityVerifierTest, WholeFileVerificationRejectsMalformedRelationshipsAndContinues) {
+    for (const auto& [mutation, repair] :
+         {std::pair{"sequence_number=5", "sequence_number=0"},
+          std::pair{"raw_offset=4", "raw_offset=0"},
+          std::pair{"raw_length=raw_length+1", "raw_length=raw_length-1"}}) {
+        execute("UPDATE entry_chunks SET " + std::string(mutation) +
+                " WHERE entry_id=(SELECT id FROM entries WHERE relative_path='a.txt')");
+        const auto result = verify(VerifyMode::full, true);
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(has_issue(result, Kind::invalid_entry_relationship));
+        EXPECT_EQ(result.checked_files, 3U);
+        EXPECT_EQ(result.checked_file_bytes, 26U);
+        EXPECT_FALSE(has_issue(result, Kind::file_hash_mismatch));
+        execute("UPDATE entry_chunks SET " + std::string(repair) +
+                " WHERE entry_id=(SELECT id FROM entries WHERE relative_path='a.txt')");
+    }
+    execute("UPDATE entries SET logical_size=logical_size+1 WHERE relative_path='a.txt'");
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(has_issue(result, Kind::invalid_entry_relationship));
+    EXPECT_EQ(result.checked_files, 3U);
+    EXPECT_EQ(result.checked_file_bytes, 39U);
+}
+
+TEST_F(IntegrityVerifierTest, WholeFileVerificationSkipsIncompleteSnapshots) {
+    execute({"UPDATE snapshots SET status='pending'", "UPDATE entries SET file_hash=NULL",
+             "DELETE FROM entry_chunks"});
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_TRUE(result.ok());
+    EXPECT_EQ(result.checked_files, 0U);
+    EXPECT_EQ(result.checked_file_bytes, 0U);
+}
+
+TEST_F(IntegrityVerifierTest, UnreadableFilesDoNotHideIndependentWholeFileHashFailures) {
+    ASSERT_TRUE(std::filesystem::remove(objects().front()));
+    execute("UPDATE entries SET file_hash='wrong' WHERE entry_type='file'");
+    const auto before = read_tree(root());
+    const auto result = verify(VerifyMode::full, true);
+    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(has_issue(result, Kind::missing_object));
+    EXPECT_TRUE(has_issue(result, Kind::file_hash_mismatch));
+    EXPECT_EQ(result.checked_files, 3U);
+    EXPECT_GT(result.checked_file_bytes, 0U);
+    EXPECT_LT(result.checked_file_bytes, 39U);
+    EXPECT_EQ(read_tree(root()), before);
+}
+
+TEST_F(IntegrityVerifierTest, CancellationDuringWholeFileVerificationReleasesLockWithoutWrites) {
+    const auto before = read_tree(root());
+    std::stop_source during;
+    bool reached_file_hashes = false;
+    expect_error(
+        [&] {
+            (void)IntegrityVerifier(*repository_)
+                .verify(
+                    VerifyMode::full, during.get_token(),
+                    [&](const ProgressEvent& event) {
+                        if (event.message == "Verifying whole-file BLAKE3 hashes") {
+                            reached_file_hashes = true;
+                            during.request_stop();
+                        }
+                    },
+                    true);
+        },
+        ErrorCode::cancelled);
+    EXPECT_TRUE(reached_file_hashes);
+    EXPECT_EQ(read_tree(root()), before);
+    EXPECT_TRUE(verify(VerifyMode::full, true).ok());
 }
 
 TEST_F(IntegrityVerifierTest, EmptyRepositoryIsHealthy) {

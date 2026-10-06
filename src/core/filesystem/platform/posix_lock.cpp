@@ -74,7 +74,7 @@ RepositoryLock::RepositoryLock(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 
 RepositoryLock RepositoryLock::acquire_exclusive(const std::filesystem::path& lock_file,
                                                  bool write_owner_diagnostics) {
-    const int flags = O_RDWR | O_CLOEXEC | (write_owner_diagnostics ? O_CREAT : 0);
+    const int flags = O_CLOEXEC | (write_owner_diagnostics ? O_RDWR | O_CREAT : O_RDONLY);
     const int fd = ::open(lock_file.c_str(), flags, 0600);
     if (fd == -1) {
         throw_filesystem_error(lock_file, "failed to open repository lock file", errno);

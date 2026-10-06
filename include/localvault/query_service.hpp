@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -22,6 +23,12 @@ template <typename T> struct Page {
     std::uint64_t total_count{};
 };
 
+struct SnapshotWarning {
+    std::filesystem::path relative_path;
+    std::string code;
+    std::string message;
+};
+
 class QueryService final {
   public:
     explicit QueryService(Repository& repository);
@@ -33,6 +40,10 @@ class QueryService final {
     // Case-sensitive literal substring matching; an empty query matches all entries.
     [[nodiscard]] Page<EntryInfo> search_paths(SnapshotId id, std::string_view query,
                                                PageRequest page = {}) const;
+    // Binary path/code order with insertion order as the tie-breaker.
+    [[nodiscard]] Page<SnapshotWarning> list_warnings(SnapshotId id, PageRequest page = {}) const;
+    // Counts only this complete snapshot and its distinct referenced chunks.
+    [[nodiscard]] RepositoryStats snapshot_stats(SnapshotId id) const;
     [[nodiscard]] RepositoryStats repository_stats() const;
 
   private:

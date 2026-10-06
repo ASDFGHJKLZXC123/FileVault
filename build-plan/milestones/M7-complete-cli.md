@@ -38,10 +38,10 @@ All core functions can be exercised without the GUI, and the CLI end-to-end suit
 2. **"My --json output breaks a parser."** Any stray `std::cout` — a progress line, a debug print, a color code — corrupts the document. Rule: in JSON mode the *only* stdout write is the final document (§28.4). The e2e suite must parse stdout strictly and fail on prefix/suffix garbage.
 3. **"What's safe inside the SIGINT handler?"** Almost nothing — no locks, no allocation, no iostreams. Set a `volatile sig_atomic_t`/atomic flag (or use `signalfd`-style self-pipe); the main thread polls it and calls `request_stop()`. On Windows the `SetConsoleCtrlHandler` callback runs on its own thread — same rule: flag only.
 4. **"How does the e2e test send Ctrl+C?"** POSIX: `proc.send_signal(SIGINT)`. Windows: `CTRL_BREAK_EVENT` to a process group created with `CREATE_NEW_PROCESS_GROUP` — genuinely fiddly; if it stays flaky, keep the signal e2e test POSIX-only and cover Windows cancellation interactively in the VM once, noting it in the verification log.
-5. **"How do I test `--overwrite prompt` non-interactively?"** Feed scripted answers via stdin in the e2e harness. Also decide the documented non-TTY behavior: `prompt` without a TTY should fail fast with a clear error rather than hang — add that to §28's behavior via a one-line plan amendment if you adopt it.
+5. **"How do I test `--overwrite prompt` non-interactively?"** Feed scripted answers via stdin in the e2e harness. User decision (2026-10-04): accept both terminal and scripted input; EOF without an answer fails with a clear error. Prompt waits remain cancellable.
 6. **"Repository-busy (exit 7) e2e test."** The Python harness grabs the lock itself: open `repository.lock` and `flock`/`msvcrt.locking` it (or run a helper subcommand that holds it), then assert the CLI returns 7 quickly, not a hang — `busy_timeout` applies to SQLite, not your lock.
 7. **"Progress bar garbage in CI logs."** Emit fancy progress only when stderr is a TTY; plain line-per-phase otherwise (also honors `--quiet`/`--no-color`).
-8. **Mac-primary note:** develop and run the whole e2e suite locally on the Mac. CI runs it on all three platforms (§32.7); when Windows e2e reveals path/console differences, that's the system working — fix, push, re-run. Budget one Windows VM session for hands-on Ctrl+C and `--json | ConvertFrom-Json` sanity checks.
+8. **Development-host amendment (2026-10-04):** develop and run the whole e2e suite on native Windows. CI still runs it on all three platforms (§32.7). Retain a human Windows session for hands-on Ctrl+C and `--json | ConvertFrom-Json` sanity checks; a VM is unnecessary on the native Windows host.
 
 ## Completion checklist
 
@@ -68,7 +68,7 @@ M7 is complete only when **every** box is checked. Copy this checklist into the 
 **Platform & CI**
 
 - [ ] e2e suite green on all three CI platforms (acceptance).
-- [ ] Windows VM (once): hands-on Ctrl+C behaves, and `localvault list --json | ConvertFrom-Json` works in PowerShell. Recorded in the verification log.
+- [ ] Human Windows session (native host or VM, once): hands-on Ctrl+C behaves, and `localvault list --json | ConvertFrom-Json` works in PowerShell. Recorded in the verification log.
 
 **Process**
 

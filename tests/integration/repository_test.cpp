@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <sqlite3.h>
 
 #include <chrono>
 #include <filesystem>
@@ -10,7 +11,11 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include "database/database.hpp"
@@ -21,6 +26,7 @@
 #include "localvault/repository.hpp"
 #include "localvault/restore_engine.hpp"
 #include "localvault/snapshot_engine.hpp"
+#include "support/test_filesystem.hpp"
 
 namespace localvault {
 
@@ -130,6 +136,34 @@ void checkpoint_database(const std::filesystem::path& path) {
     ASSERT_EQ(checkpoint.column_int64(0), 0);
     ASSERT_FALSE(checkpoint.step());
 }
+
+#ifndef _WIN32
+int child_database_lock_probe(const std::filesystem::path& path) {
+    const auto child = ::fork();
+    if (child < 0) {
+        return -1;
+    }
+    if (child == 0) {
+        const auto descriptor = ::open(path.c_str(), O_RDWR);
+        if (descriptor < 0) {
+            ::_exit(3);
+        }
+        struct flock lock{};
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = 0x40000002;
+        lock.l_len = 510;
+        const auto result = ::fcntl(descriptor, F_SETLK, &lock);
+        ::_exit(result == 0 ? 1 : (errno == EACCES || errno == EAGAIN ? 0 : 2));
+    }
+    int status{};
+    pid_t waited{};
+    do {
+        waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
 
 void expect_invalid_repository(const std::filesystem::path& root) {
     try {
@@ -375,7 +409,8 @@ TEST(RepositoryTest, InterruptedDeletingRecoveryRetriesAndFinishesOnTheSameOpenR
     repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(2));
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository),
+                     std::runtime_error);
         (void)writer_lock;
     }
     {
@@ -478,7 +513,8 @@ TEST(RepositoryTest, InterruptedPendingCleanupRetriesWithoutLosingFailureInforma
     repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(3));
     {
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository),
+                     std::runtime_error);
         (void)writer_lock;
     }
     {
@@ -522,7 +558,8 @@ TEST(RepositoryTest, InterruptedWarningCleanupFinishesAfterRepositoryReopen) {
         RepositoryTestAccess::set_recovery_entry_batch_limit(repository, 1);
         repository.set_failure_injector(std::make_shared<ThrowOnOccurrenceInjector>(4));
         RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
-        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository), std::runtime_error);
+        EXPECT_THROW(RepositoryTestAccess::recover_after_writer_lock(repository),
+                     std::runtime_error);
     }
     {
         Database database(root / "repository.db");
@@ -730,10 +767,151 @@ TEST(RepositoryTest, ReadOnlyOpenCreatesNoEntriesAndTakesNoWriterLock) {
 
     Repository repository = Repository::open(root, OpenMode::read_only);
     RepositoryLock writer_lock = RepositoryLock::acquire_exclusive(root / "repository.lock");
+    auto query_reader = Repository::open_for_query(root);
 
     EXPECT_EQ(entries_below(root), before);
     EXPECT_EQ(repository.info().format_version, 1U);
+    EXPECT_EQ(query_reader.info().format_version, 1U);
     (void)writer_lock;
+}
+
+TEST(RepositoryTest, QueryOpenUsesNonWritingLockedViewWithoutWalSidecars) {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path() / "repository";
+    Repository::create(root);
+    checkpoint_database(root / "repository.db");
+    std::filesystem::remove(root / "repository.db-wal");
+    std::filesystem::remove(root / "repository.db-shm");
+    const auto names = entries_below(root);
+    const auto database_before = test::read_all_bytes(root / "repository.db");
+    const auto lock_before = test::read_all_bytes(root / "repository.lock");
+    {
+        auto reader = Repository::open_for_query(root);
+        EXPECT_EQ(reader.info().format_version, 1U);
+        try {
+            (void)RepositoryLock::acquire_exclusive(root / "repository.lock", false);
+            FAIL() << "sidecar-free queries require the retained repository lock";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::repository_busy);
+        }
+    }
+    EXPECT_EQ(entries_below(root), names);
+    EXPECT_EQ(test::read_all_bytes(root / "repository.db"), database_before);
+    EXPECT_EQ(test::read_all_bytes(root / "repository.lock"), lock_before);
+}
+
+TEST(RepositoryTest, StandaloneMaintenanceOpenRetainsBothLocksAndLiveWalUntilClose) {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path() / "repository";
+    Repository::create(root);
+    {
+        Database writer(root / "repository.db");
+        int enabled{};
+        ASSERT_EQ(sqlite3_db_config(writer.handle(), SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &enabled),
+                  SQLITE_OK);
+        writer.execute("UPDATE repository_info SET repository_uuid = 'committed-in-wal'");
+    }
+    const auto names = entries_below(root);
+    const std::array<std::string, 4> files{"repository.db", "repository.db-wal",
+                                           "repository.db-shm", "repository.lock"};
+    std::array<std::vector<std::byte>, 4> before;
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        before[index] = test::read_all_bytes(root / files[index]);
+    }
+    {
+        auto maintenance = Repository::open(root, OpenMode::maintenance_read_only);
+        EXPECT_EQ(maintenance.info().repository_uuid, "committed-in-wal");
+        try {
+            (void)RepositoryLock::acquire_exclusive(root / "repository.lock", false);
+            FAIL() << "maintenance must retain the exclusive repository lock";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::repository_busy);
+        }
+#ifndef _WIN32
+        // Do not read/close the main DB via another FD while native fcntl locks are live.
+        EXPECT_EQ(child_database_lock_probe(root / "repository.db"), 0);
+#endif
+    }
+    EXPECT_EQ(entries_below(root), names);
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        EXPECT_EQ(test::read_all_bytes(root / files[index]), before[index]);
+    }
+    EXPECT_NO_THROW((void)RepositoryLock::acquire_exclusive(root / "repository.lock", false));
+#ifndef _WIN32
+    EXPECT_EQ(child_database_lock_probe(root / "repository.db"), 1);
+#endif
+}
+
+TEST(RepositoryTest, BusyMaintenanceOpenFailsBeforeTouchingDatabaseOrSidecars) {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path() / "repository";
+    Repository::create(root);
+    checkpoint_database(root / "repository.db");
+    std::filesystem::remove(root / "repository.db-wal");
+    std::filesystem::remove(root / "repository.db-shm");
+    const auto names = entries_below(root);
+    const auto database_before = test::read_all_bytes(root / "repository.db");
+    const auto lock_before = test::read_all_bytes(root / "repository.lock");
+    {
+        const auto lock = RepositoryLock::acquire_exclusive(root / "repository.lock", false);
+        try {
+            (void)Repository::open(root, OpenMode::maintenance_read_only);
+            FAIL() << "maintenance open must reject a competing repository lock";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::repository_busy);
+        }
+    }
+    EXPECT_EQ(entries_below(root), names);
+    EXPECT_EQ(test::read_all_bytes(root / "repository.db"), database_before);
+    EXPECT_EQ(test::read_all_bytes(root / "repository.lock"), lock_before);
+}
+
+TEST(RepositoryTest, MaintenanceOpenNeedsOnlyReadAccessToLockFileAndRemainsExclusive) {
+    TemporaryDirectory temporary;
+    const auto root = temporary.path() / "repository";
+    Repository::create(root);
+    const auto lock_path = root / "repository.lock";
+    const auto lock_before = test::read_all_bytes(lock_path);
+    const auto database_before = test::read_all_bytes(root / "repository.db");
+    const auto names = entries_below(root);
+    struct RestorePermissions {
+        std::filesystem::path path;
+        std::filesystem::perms original;
+        ~RestorePermissions() {
+            std::error_code ignored;
+            std::filesystem::permissions(path, original, std::filesystem::perm_options::replace,
+                                         ignored);
+        }
+    } restore{lock_path, std::filesystem::status(lock_path).permissions()};
+    std::filesystem::permissions(lock_path, std::filesystem::perms::owner_read,
+                                 std::filesystem::perm_options::replace);
+    {
+        std::fstream write_probe(lock_path, std::ios::in | std::ios::out | std::ios::binary);
+        if (write_probe.is_open()) {
+            GTEST_SKIP() << "current privileges bypass read-only file permissions";
+        }
+    }
+    {
+        auto maintenance = Repository::open(root, OpenMode::maintenance_read_only);
+        EXPECT_EQ(maintenance.format_version(), 1U);
+        try {
+            (void)RepositoryLock::acquire_exclusive(lock_path, false);
+            FAIL() << "read-access maintenance lock must still exclude another holder";
+        } catch (const LocalVaultError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::repository_busy);
+        }
+    }
+    EXPECT_NO_THROW((void)RepositoryLock::acquire_exclusive(lock_path, false));
+    EXPECT_EQ(entries_below(root), names);
+    EXPECT_EQ(test::read_all_bytes(lock_path), lock_before);
+    EXPECT_EQ(test::read_all_bytes(root / "repository.db"), database_before);
+}
+
+TEST(RepositoryTest, NonWritingLockAcquisitionDoesNotCreateMissingFile) {
+    TemporaryDirectory temporary;
+    const auto lock_path = temporary.path() / "missing.lock";
+    EXPECT_THROW((void)RepositoryLock::acquire_exclusive(lock_path, false), LocalVaultError);
+    EXPECT_FALSE(std::filesystem::exists(lock_path));
 }
 
 TEST(RepositoryTest, WritableRepositoryWithoutWalSidecarsIsRejectedWithoutCreatingPaths) {
@@ -758,6 +936,7 @@ TEST(RepositoryTest, ReadOnlyOpenRejectsAnIncompleteWalSidecarPair) {
     const std::set<std::filesystem::path> before = entries_below(root);
 
     expect_invalid_repository(root);
+    EXPECT_THROW((void)Repository::open_for_query(root), LocalVaultError);
 
     EXPECT_EQ(entries_below(root), before);
 }

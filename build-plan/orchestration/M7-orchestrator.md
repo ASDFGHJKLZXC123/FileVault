@@ -7,7 +7,7 @@ Reading set: Part 08 (§28, §31) · 09 (§32.7) · 11 (§42.10)
 
 - Exit codes and JSON schema freeze at release — orchestrator signs off both before command packets start.
 - If any feature can't be a thin command over `localvault_core`, logic leaked — fix the core seam, don't work around it.
-- Decision to record (plan amendment if adopted): `--overwrite prompt` without a TTY fails fast.
+- User decision (2026-10-04): restore prompts accept terminal and scripted stdin; EOF fails clearly.
 
 ## Packets
 
@@ -32,4 +32,4 @@ Reading set: Part 08 (§28, §31) · 09 (§32.7) · 11 (§42.10)
 
 - Fresh agent: checklist → `docs/implementation-logs/M7/`; FR-500/503, FR-303/307 mapped to e2e cases.
 - e2e green on all three CI platforms (acceptance).
-- Richard: Windows VM (once) — hands-on Ctrl+C; `localvault list --json | ConvertFrom-Json`.
+- Richard: native Windows session (once) — hands-on Ctrl+C; `localvault list --json | ConvertFrom-Json`.

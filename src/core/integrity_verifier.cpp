@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -13,6 +15,7 @@
 #include "filesystem/platform/platform_lock.hpp"
 #include "localvault/error.hpp"
 #include "localvault/repository.hpp"
+#include "storage/blake3_hasher.hpp"
 #include "storage/object_store.hpp"
 
 namespace localvault {
@@ -267,6 +270,106 @@ void check_objects(Database& db, const std::filesystem::path& root, ObjectStore&
     }
 }
 
+void check_file_hashes(Database& db, const std::filesystem::path& root, ObjectStore& store,
+                       ByteCount maximum_raw_size, VerificationResult& result, std::stop_token stop,
+                       const ProgressCallback& progress) {
+    auto files = db.statement(
+        "SELECT e.id, e.relative_path, e.logical_size, e.file_hash, typeof(e.logical_size), "
+        "typeof(e.file_hash)='text' AND length(e.file_hash)=64 "
+        "AND e.file_hash NOT GLOB '*[^0-9a-f]*' "
+        "FROM entries e JOIN snapshots s ON s.id=e.snapshot_id "
+        "WHERE s.status='complete' AND e.entry_type='file' ORDER BY e.id");
+    auto chunks =
+        db.statement("SELECT ec.sequence_number, ec.raw_offset, ec.raw_length, c.raw_size, "
+                     "c.compressed_size, c.hash, c.object_path, "
+                     "typeof(ec.sequence_number)='integer' AND typeof(ec.raw_offset)='integer' "
+                     "AND typeof(ec.raw_length)='integer' AND typeof(c.raw_size)='integer' "
+                     "AND typeof(c.compressed_size)='integer' "
+                     "FROM entry_chunks ec LEFT JOIN chunks c ON c.hash=ec.chunk_hash "
+                     "WHERE ec.entry_id=:entry ORDER BY ec.sequence_number");
+    while (files.step()) {
+        check_cancelled(stop);
+        ++result.checked_files;
+        const auto path = utf8_path(files.column_text(1));
+        Kind failure_kind = Kind::invalid_entry_relationship;
+        try {
+            const auto logical_size = files.column_int64(2);
+            if (logical_size < 0 || files.column_text(4) != "integer") {
+                throw LocalVaultError(ErrorCode::object_corrupt, "file logical size is invalid");
+            }
+            ByteCount offset = 0;
+            std::int64_t sequence = 0;
+            Blake3Hasher hasher;
+            chunks.bind(":entry", files.column_int64(0));
+            while (chunks.step()) {
+                check_cancelled(stop);
+                failure_kind = Kind::invalid_entry_relationship;
+                const auto length = chunks.column_int64(2);
+                if (chunks.column_int64(7) == 0 || chunks.column_is_null(5) ||
+                    chunks.column_int64(0) != sequence || chunks.column_int64(1) < 0 ||
+                    static_cast<ByteCount>(chunks.column_int64(1)) != offset || length <= 0 ||
+                    length != chunks.column_int64(3) ||
+                    static_cast<ByteCount>(length) > maximum_raw_size ||
+                    static_cast<ByteCount>(length) >
+                        static_cast<ByteCount>(logical_size) - offset ||
+                    sequence == (std::numeric_limits<std::int64_t>::max)()) {
+                    throw LocalVaultError(ErrorCode::object_corrupt,
+                                          "file has invalid or non-contiguous chunk metadata");
+                }
+                failure_kind = Kind::corrupt_object;
+                const auto hash = chunks.column_text(5);
+                const auto relative = ObjectStore::object_relative_path(hash);
+                if (relative.generic_string() != chunks.column_text(6)) {
+                    throw LocalVaultError(
+                        ErrorCode::object_corrupt,
+                        "stored object path does not match its BLAKE3 identifier");
+                }
+                require_safe_object(root, relative);
+                const auto raw =
+                    store.read_verified(hash, relative, static_cast<ByteCount>(length),
+                                        static_cast<ByteCount>(chunks.column_int64(4)));
+                hasher.update(raw);
+                if (raw.size() >
+                    (std::numeric_limits<ByteCount>::max)() - result.checked_file_bytes) {
+                    throw LocalVaultError(ErrorCode::object_corrupt, "checked file sizes overflow");
+                }
+                result.checked_file_bytes += static_cast<ByteCount>(raw.size());
+                offset += static_cast<ByteCount>(length);
+                ++sequence;
+                if (progress) {
+                    ProgressEvent event;
+                    event.phase = OperationPhase::verifying;
+                    event.current_path = path;
+                    event.processed_entries = result.checked_objects;
+                    event.processed_bytes = result.checked_stored_bytes;
+                    event.message = "Verifying whole-file BLAKE3 hashes";
+                    progress(event);
+                }
+            }
+            failure_kind = Kind::invalid_entry_relationship;
+            if (offset != static_cast<ByteCount>(logical_size)) {
+                throw LocalVaultError(ErrorCode::object_corrupt,
+                                      "reconstructed file size does not match entry metadata");
+            }
+            if (files.column_is_null(3) || files.column_int64(5) == 0) {
+                issue(result, Kind::file_hash_mismatch, path,
+                      "file has a missing or malformed whole-file BLAKE3 hash");
+            } else if (Blake3Hasher::to_hex(hasher.finalize()) != files.column_text(3)) {
+                issue(result, Kind::file_hash_mismatch, path,
+                      "reconstructed file failed whole-file BLAKE3 verification");
+            }
+        } catch (const LocalVaultError& error) {
+            if (error.code() == ErrorCode::database_error || error.code() == ErrorCode::cancelled) {
+                throw;
+            }
+            issue(result,
+                  error.code() == ErrorCode::object_missing ? Kind::missing_object : failure_kind,
+                  path, error.what());
+        }
+        chunks.reset();
+    }
+}
+
 void check_files(Database& db, const std::filesystem::path& root,
                  const std::filesystem::path& directory, bool temporary, VerificationResult& result,
                  std::stop_token stop) {
@@ -330,21 +433,34 @@ bool VerificationResult::ok() const noexcept {
 IntegrityVerifier::IntegrityVerifier(Repository& repository) : repository_(repository) {}
 
 VerificationResult IntegrityVerifier::verify(VerifyMode mode, std::stop_token stop,
-                                             ProgressCallback progress) {
-    if (repository_.open_mode() != OpenMode::read_write) {
+                                             ProgressCallback progress, bool verify_files) {
+    const bool maintenance_view = repository_.open_mode() == OpenMode::maintenance_read_only;
+    if (repository_.open_mode() != OpenMode::read_write && !maintenance_view) {
         throw LocalVaultError(ErrorCode::invalid_argument,
                               "verification requires a read-write repository", repository_.root());
     }
     if (mode != VerifyMode::quick && mode != VerifyMode::full) {
         throw LocalVaultError(ErrorCode::invalid_argument, "unknown verification mode");
     }
+    if (verify_files && mode != VerifyMode::full) {
+        throw LocalVaultError(ErrorCode::invalid_argument,
+                              "whole-file verification requires full mode");
+    }
     check_cancelled(stop);
     repository_.validate_root_after_open();
-    const auto lock =
-        RepositoryLock::acquire_exclusive(repository_.root() / "repository.lock", false);
+    std::optional<RepositoryLock> lock;
+    if (!maintenance_view) {
+        lock.emplace(
+            RepositoryLock::acquire_exclusive(repository_.root() / "repository.lock", false));
+    }
     repository_.validate_root_after_open();
     // Recovery would destroy the very stale metadata and temporary files we must report.
-    Database db(repository_.root() / "repository.db", DatabaseAccess::locked_read_only);
+    std::unique_ptr<Database> read_view;
+    if (!maintenance_view) {
+        read_view = std::make_unique<Database>(repository_.root() / "repository.db",
+                                               DatabaseAccess::locked_read_only);
+    }
+    auto& db = read_view ? *read_view : repository_.database();
     VerificationResult result;
     check_database(result, [&] {
         auto integrity = db.statement("PRAGMA integrity_check");
@@ -383,6 +499,13 @@ VerificationResult IntegrityVerifier::verify(VerifyMode mode, std::stop_token st
         check_objects(db, repository_.root(), store, maximum_raw_size, mode, result, stop,
                       throttled_progress);
     });
+    if (verify_files) {
+        last_progress = std::chrono::steady_clock::time_point::min();
+        check_database(result, [&] {
+            check_file_hashes(db, repository_.root(), store, maximum_raw_size, result, stop,
+                              throttled_progress);
+        });
+    }
     for (const std::string_view directory : {"objects", "temporary"}) {
         check_cancelled(stop);
         check_database(result, [&] {

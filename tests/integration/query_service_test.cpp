@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "database/database.hpp"
+#include "database/metadata_store.hpp"
 #include "database/statement.hpp"
 #include "filesystem/platform/platform_lock.hpp"
 #include "localvault/error.hpp"
@@ -87,6 +88,11 @@ class QueryServiceTest : public testing::Test {
         insert.execute();
     }
 
+    void warning(SnapshotId id, std::string_view path, std::string_view code,
+                 std::string_view message) {
+        MetadataStore(*database).insert_warning(id, path, code, message);
+    }
+
     test::TemporaryDirectory temporary;
     const std::filesystem::path root = temporary.path() / "repository";
     std::unique_ptr<Repository> repository;
@@ -127,6 +133,15 @@ TEST_F(QueryServiceTest, SingleSnapshotStatisticsUseFilesAndReferencedChunksOnly
     EXPECT_DOUBLE_EQ(stats.deduplication_savings, 0.0);
     EXPECT_DOUBLE_EQ(stats.compression_savings, 0.6);
     EXPECT_DOUBLE_EQ(stats.total_savings, 0.6);
+    const auto selected = query->snapshot_stats(id);
+    EXPECT_EQ(selected.complete_snapshot_count, 1U);
+    EXPECT_EQ(selected.logical_bytes, 100U);
+    EXPECT_EQ(selected.unique_chunk_count, 1U);
+    EXPECT_EQ(selected.unique_raw_bytes, 100U);
+    EXPECT_EQ(selected.stored_bytes, 40U);
+    EXPECT_DOUBLE_EQ(selected.deduplication_savings, 0.0);
+    EXPECT_DOUBLE_EQ(selected.compression_savings, 0.6);
+    EXPECT_DOUBLE_EQ(selected.total_savings, 0.6);
 }
 
 TEST_F(QueryServiceTest, DuplicateChunksWithinSnapshotCountUniqueBytesOnce) {
@@ -144,6 +159,14 @@ TEST_F(QueryServiceTest, DuplicateChunksWithinSnapshotCountUniqueBytesOnce) {
     EXPECT_EQ(stats.stored_bytes, 40U);
     EXPECT_DOUBLE_EQ(stats.deduplication_savings, 1.0 - 100.0 / 300.0);
     EXPECT_DOUBLE_EQ(stats.total_savings, 1.0 - 40.0 / 300.0);
+    const auto selected = query->snapshot_stats(id);
+    EXPECT_EQ(selected.logical_bytes, 300U);
+    EXPECT_EQ(selected.unique_chunk_count, 1U);
+    EXPECT_EQ(selected.unique_raw_bytes, 100U);
+    EXPECT_EQ(selected.stored_bytes, 40U);
+    EXPECT_DOUBLE_EQ(selected.deduplication_savings, 1.0 - 100.0 / 300.0);
+    EXPECT_DOUBLE_EQ(selected.compression_savings, 0.6);
+    EXPECT_DOUBLE_EQ(selected.total_savings, 1.0 - 40.0 / 300.0);
 }
 
 TEST_F(QueryServiceTest, ChunksSharedAcrossSnapshotsCountUniqueBytesOnce) {
@@ -162,6 +185,18 @@ TEST_F(QueryServiceTest, ChunksSharedAcrossSnapshotsCountUniqueBytesOnce) {
     EXPECT_EQ(stats.stored_bytes, 70U);
     EXPECT_DOUBLE_EQ(stats.deduplication_savings, 1.0 - 150.0 / 250.0);
     EXPECT_DOUBLE_EQ(stats.compression_savings, 1.0 - 70.0 / 150.0);
+    const auto first_stats = query->snapshot_stats(first);
+    EXPECT_EQ(first_stats.complete_snapshot_count, 1U);
+    EXPECT_EQ(first_stats.logical_bytes, 100U);
+    EXPECT_EQ(first_stats.unique_chunk_count, 1U);
+    EXPECT_EQ(first_stats.unique_raw_bytes, 100U);
+    EXPECT_EQ(first_stats.stored_bytes, 40U);
+    const auto second_stats = query->snapshot_stats(second);
+    EXPECT_EQ(second_stats.complete_snapshot_count, 1U);
+    EXPECT_EQ(second_stats.logical_bytes, 150U);
+    EXPECT_EQ(second_stats.unique_chunk_count, 2U);
+    EXPECT_EQ(second_stats.unique_raw_bytes, 150U);
+    EXPECT_EQ(second_stats.stored_bytes, 70U);
 }
 
 TEST_F(QueryServiceTest, IncompleteSnapshotsAndUnreferencedChunksAreExcluded) {
@@ -173,6 +208,8 @@ TEST_F(QueryServiceTest, IncompleteSnapshotsAndUnreferencedChunksAreExcluded) {
         EXPECT_THROW((void)query->get_snapshot(id), LocalVaultError);
         EXPECT_THROW((void)query->list_children(id, ""), LocalVaultError);
         EXPECT_THROW((void)query->search_paths(id, "hidden"), LocalVaultError);
+        EXPECT_THROW((void)query->snapshot_stats(id), LocalVaultError);
+        EXPECT_THROW((void)query->list_warnings(id), LocalVaultError);
     }
     const auto stats = query->repository_stats();
     EXPECT_EQ(stats.complete_snapshot_count, 0U);
@@ -184,13 +221,23 @@ TEST_F(QueryServiceTest, IncompleteSnapshotsAndUnreferencedChunksAreExcluded) {
 }
 
 TEST_F(QueryServiceTest, EmptyFilesHaveZeroDenominatorSavings) {
-    entry(snapshot(), "empty", 0);
+    const auto id = snapshot();
+    entry(id, "empty", 0);
     const auto stats = query->repository_stats();
     EXPECT_EQ(stats.complete_snapshot_count, 1U);
     EXPECT_EQ(stats.unique_chunk_count, 0U);
     EXPECT_DOUBLE_EQ(stats.deduplication_savings, 0.0);
     EXPECT_DOUBLE_EQ(stats.compression_savings, 0.0);
     EXPECT_DOUBLE_EQ(stats.total_savings, 0.0);
+    const auto selected = query->snapshot_stats(id);
+    EXPECT_EQ(selected.complete_snapshot_count, 1U);
+    EXPECT_EQ(selected.unique_chunk_count, 0U);
+    EXPECT_EQ(selected.logical_bytes, 0U);
+    EXPECT_EQ(selected.unique_raw_bytes, 0U);
+    EXPECT_EQ(selected.stored_bytes, 0U);
+    EXPECT_DOUBLE_EQ(selected.deduplication_savings, 0.0);
+    EXPECT_DOUBLE_EQ(selected.compression_savings, 0.0);
+    EXPECT_DOUBLE_EQ(selected.total_savings, 0.0);
 }
 
 TEST_F(QueryServiceTest, IncompressibleContentKeepsNegativeSavings) {
@@ -207,7 +254,9 @@ TEST_F(QueryServiceTest, UnsignedStatisticsTotalsAllowSignedRangeAndRejectOverfl
     entry(id, "one", maximum);
     entry(id, "two", maximum);
     EXPECT_EQ(query->repository_stats().logical_bytes, static_cast<std::uint64_t>(maximum) * 2U);
+    EXPECT_EQ(query->snapshot_stats(id).logical_bytes, static_cast<std::uint64_t>(maximum) * 2U);
     entry(id, "three", 2);
+    EXPECT_THROW((void)query->snapshot_stats(id), LocalVaultError);
     try {
         (void)query->repository_stats();
         FAIL() << "unsigned aggregate overflow must fail";
@@ -217,7 +266,9 @@ TEST_F(QueryServiceTest, UnsignedStatisticsTotalsAllowSignedRangeAndRejectOverfl
 }
 
 TEST_F(QueryServiceTest, NegativeStoredLogicalSizesAreRejected) {
-    entry(snapshot(), "negative", -1);
+    const auto id = snapshot();
+    entry(id, "negative", -1);
+    EXPECT_THROW((void)query->snapshot_stats(id), LocalVaultError);
     try {
         (void)query->repository_stats();
         FAIL() << "negative sizes must fail";
@@ -236,10 +287,37 @@ TEST_F(QueryServiceTest, ChunkStatisticsUseCheckedUnsignedAggregates) {
     const auto stats = query->repository_stats();
     EXPECT_EQ(stats.unique_raw_bytes, static_cast<std::uint64_t>(maximum) * 2U);
     EXPECT_EQ(stats.stored_bytes, static_cast<std::uint64_t>(maximum) * 2U);
+    const auto selected = query->snapshot_stats(id);
+    EXPECT_EQ(selected.unique_raw_bytes, static_cast<std::uint64_t>(maximum) * 2U);
+    EXPECT_EQ(selected.stored_bytes, static_cast<std::uint64_t>(maximum) * 2U);
     const std::string hash_c(64, 'c');
     chunk(hash_c, 2, 2);
     reference(entry(id, "three"), hash_c);
     EXPECT_THROW((void)query->repository_stats(), LocalVaultError);
+    EXPECT_THROW((void)query->snapshot_stats(id), LocalVaultError);
+}
+
+TEST_F(QueryServiceTest, WarningsAreSnapshotScopedAndPagedWithDeterministicOrdering) {
+    const auto id = snapshot();
+    warning(snapshot(), "other", "unreadable", "another snapshot");
+    EXPECT_EQ(query->list_warnings(id).total_count, 0U);
+    warning(id, "zulu", "unreadable", "last path");
+    warning(id, "Alpha", "z_code", "last code");
+    warning(id, "Alpha", "a_code", "first duplicate");
+    warning(id, "Alpha", "a_code", "second duplicate");
+    const auto page = query->list_warnings(id, {1, 2});
+    EXPECT_EQ(page.total_count, 4U);
+    ASSERT_EQ(page.items.size(), 2U);
+    EXPECT_EQ(page.items.front().relative_path, "Alpha");
+    EXPECT_EQ(page.items.front().code, "a_code");
+    EXPECT_EQ(page.items.front().message, "second duplicate");
+    EXPECT_EQ(page.items.back().code, "z_code");
+    EXPECT_EQ(page.items.back().message, "last code");
+    EXPECT_EQ(query->list_warnings(id, {0, 1}).items.front().message, "first duplicate");
+    EXPECT_EQ(query->list_warnings(id, {3, 1}).items.front().relative_path, "zulu");
+    const auto beyond = query->list_warnings(id, {4, 1});
+    EXPECT_EQ(beyond.total_count, 4U);
+    EXPECT_TRUE(beyond.items.empty());
 }
 
 TEST_F(QueryServiceTest, SnapshotPagesAreNewestFirstWithStableIdTieBreakAndMetadata) {
@@ -320,6 +398,10 @@ TEST_F(QueryServiceTest, UnsafePathsInvalidIdsAndInvalidPagesAreRejected) {
     EXPECT_THROW((void)query->get_snapshot(999), LocalVaultError);
     EXPECT_THROW((void)query->list_children(999, ""), LocalVaultError);
     EXPECT_THROW((void)query->search_paths(999, ""), LocalVaultError);
+    EXPECT_THROW((void)query->snapshot_stats(-1), LocalVaultError);
+    EXPECT_THROW((void)query->snapshot_stats(999), LocalVaultError);
+    EXPECT_THROW((void)query->list_warnings(-1), LocalVaultError);
+    EXPECT_THROW((void)query->list_warnings(999), LocalVaultError);
     for (const auto page :
          {PageRequest{0, 0}, PageRequest{0, 10'001},
           PageRequest{(std::numeric_limits<std::uint64_t>::max)(), 1},
@@ -327,6 +409,7 @@ TEST_F(QueryServiceTest, UnsafePathsInvalidIdsAndInvalidPagesAreRejected) {
         EXPECT_THROW((void)query->list_snapshots(page), LocalVaultError);
         EXPECT_THROW((void)query->list_children(id, "", page), LocalVaultError);
         EXPECT_THROW((void)query->search_paths(id, "", page), LocalVaultError);
+        EXPECT_THROW((void)query->list_warnings(id, page), LocalVaultError);
     }
 }
 
@@ -342,6 +425,8 @@ TEST_F(QueryServiceTest, ReadOnlyQueriesWorkWhileWriterLockIsHeldWithoutReadingO
     EXPECT_EQ(reader.list_children(id, "").total_count, 1U);
     EXPECT_EQ(reader.search_paths(id, "file").total_count, 1U);
     EXPECT_EQ(reader.repository_stats().stored_bytes, 40U);
+    EXPECT_EQ(reader.snapshot_stats(id).stored_bytes, 40U);
+    EXPECT_EQ(reader.list_warnings(id).total_count, 0U);
     EXPECT_FALSE(std::filesystem::exists(root / ("objects/" + hash_a + ".zst")));
 }
 

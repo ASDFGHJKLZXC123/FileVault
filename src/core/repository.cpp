@@ -192,6 +192,14 @@ void validate_creation_root(const std::filesystem::path& root) {
     if (mode == OpenMode::read_write) {
         return DatabaseAccess::read_write;
     }
+    if (mode == OpenMode::maintenance_read_only) {
+        if (wal_exists != shm_exists) {
+            throw LocalVaultError(ErrorCode::invalid_repository,
+                                  "maintenance open requires both SQLite WAL sidecars or neither",
+                                  root / "repository.db");
+        }
+        return wal_exists ? DatabaseAccess::locked_read_only : DatabaseAccess::immutable_read_only;
+    }
     if (wal_exists && shm_exists) {
         return DatabaseAccess::read_only;
     }
@@ -414,7 +422,7 @@ void create_empty_file(CreationLedger& ledger, std::size_t index) {
 }
 
 [[nodiscard]] bool clear_directory_contents(const std::filesystem::path& directory,
-                                             std::stop_token token) {
+                                            std::stop_token token) {
     check_recovery_stop(token);
     std::error_code error;
     std::filesystem::directory_iterator iterator(directory, error);
@@ -503,15 +511,17 @@ void require_recovery_directory(const std::filesystem::path& directory) {
 
 class Repository::Impl final {
   public:
-    Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database> database,
-         OpenMode mode)
+    Impl(std::filesystem::path root, RepositoryInfo info, std::unique_ptr<Database>&& database,
+         OpenMode mode, std::optional<RepositoryLock>&& maintenance_lock)
         : root_(std::move(root)), canonical_root_(std::filesystem::canonical(root_)),
-          info_(std::move(info)), database_(std::move(database)),
-          mode_(mode), failure_injector_(noop_failure_injector()) {}
+          info_(std::move(info)), maintenance_lock_(std::move(maintenance_lock)),
+          database_(std::move(database)), mode_(mode), failure_injector_(noop_failure_injector()) {}
 
     std::filesystem::path root_;
     std::filesystem::path canonical_root_;
     RepositoryInfo info_;
+    // Declaration order closes SQLite before releasing the maintenance lock.
+    std::optional<RepositoryLock> maintenance_lock_;
     std::unique_ptr<Database> database_;
     OpenMode mode_;
     std::shared_ptr<FailureInjector> failure_injector_;
@@ -739,11 +749,26 @@ Repository Repository::open(const std::filesystem::path& requested_root, OpenMod
     }
 
     validate_layout(root);
+    std::optional<RepositoryLock> maintenance_lock;
+    if (mode == OpenMode::maintenance_read_only) {
+        maintenance_lock.emplace(
+            RepositoryLock::acquire_exclusive(root / "repository.lock", false));
+        validate_layout(root);
+    }
     const std::filesystem::path database_path = root / "repository.db";
     const DatabaseAccess access = database_access_for_open(root, mode);
     auto database = std::make_unique<Database>(database_path, access);
     RepositoryInfo info = load_repository_info(*database, database_path);
-    return Repository(std::make_unique<Impl>(root, std::move(info), std::move(database), mode));
+    return Repository(std::make_unique<Impl>(root, std::move(info), std::move(database), mode,
+                                             std::move(maintenance_lock)));
+}
+
+Repository Repository::open_for_query(const std::filesystem::path& requested_root) {
+    const auto root = normalized_root(requested_root);
+    const bool wal_exists = regular_file_exists_no_follow(root / "repository.db-wal");
+    const bool shm_exists = regular_file_exists_no_follow(root / "repository.db-shm");
+    return open(root,
+                wal_exists || shm_exists ? OpenMode::read_only : OpenMode::maintenance_read_only);
 }
 
 Repository::Repository(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

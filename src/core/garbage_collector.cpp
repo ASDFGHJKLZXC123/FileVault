@@ -175,19 +175,25 @@ void GarbageCollector::delete_snapshot(SnapshotId id, std::stop_token token) try
 GarbageCollectionResult GarbageCollector::collect(const GarbageCollectionOptions& options,
                                                   std::stop_token token,
                                                   ProgressCallback progress) try {
-    if (repository_.open_mode() != OpenMode::read_write || options.batch_size == 0 ||
-        options.batch_size > 10'000) {
+    const bool maintenance_preview =
+        repository_.open_mode() == OpenMode::maintenance_read_only && options.dry_run;
+    if ((repository_.open_mode() != OpenMode::read_write && !maintenance_preview) ||
+        options.batch_size == 0 || options.batch_size > 10'000) {
         throw LocalVaultError(ErrorCode::invalid_argument,
-                              "GC requires a writable repository and batch size in 1..10000");
+                              "GC requires a writable repository or maintenance preview, "
+                              "and batch size in 1..10000");
     }
     check_stop(token);
     const auto& root = repository_.root();
     repository_.validate_root_after_open();
     (void)regular_size(root / "repository.lock");
-    const auto lock = RepositoryLock::acquire_exclusive(root / "repository.lock", !options.dry_run);
+    std::optional<RepositoryLock> lock;
+    if (!maintenance_preview) {
+        lock.emplace(RepositoryLock::acquire_exclusive(root / "repository.lock", !options.dry_run));
+    }
     repository_.validate_root_after_open();
     std::optional<Database> preview_database;
-    if (options.dry_run) {
+    if (options.dry_run && !maintenance_preview) {
         preview_database.emplace(root / "repository.db", DatabaseAccess::locked_read_only);
     }
     Database& database = preview_database ? *preview_database : repository_.database();

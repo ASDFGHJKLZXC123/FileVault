@@ -28,7 +28,12 @@ struct RepositoryInfo {
     std::string hash_algorithm;
 };
 
-enum class OpenMode { read_only, read_write };
+enum class OpenMode {
+    read_only,
+    read_write,
+    // Non-writing maintenance view; retains the exclusive repository lock until closed.
+    maintenance_read_only,
+};
 
 class Repository final {
   public:
@@ -36,6 +41,8 @@ class Repository final {
                        const RepositoryCreateOptions& options = {});
 
     static Repository open(const std::filesystem::path& root, OpenMode mode = OpenMode::read_write);
+    // Uses concurrent readers when sidecars exist, otherwise a locked non-writing view.
+    static Repository open_for_query(const std::filesystem::path& root);
 
     Repository(Repository&&) noexcept;
     Repository& operator=(Repository&&) noexcept;

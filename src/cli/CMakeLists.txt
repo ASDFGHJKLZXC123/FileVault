@@ -1,6 +1,10 @@
 add_executable(
     localvault
     main.cpp
+    output.cpp
+    commands_basic.cpp
+    commands_maintenance.cpp
+    console.cpp
 )
 
 target_link_libraries(

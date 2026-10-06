@@ -24,7 +24,8 @@ struct VerificationIssue {
         invalid_database,
         invalid_repository_info,
         stale_chunk_metadata,
-        orphan_object
+        orphan_object,
+        file_hash_mismatch
     };
     enum class Severity { note, error };
 
@@ -39,6 +40,9 @@ struct VerificationResult {
     std::uint64_t checked_entries{};
     std::uint64_t checked_objects{};
     ByteCount checked_stored_bytes{};
+    // Complete regular files attempted and raw bytes successfully reconstructed.
+    std::uint64_t checked_files{};
+    ByteCount checked_file_bytes{};
     std::vector<VerificationIssue> issues;
 
     [[nodiscard]] bool ok() const noexcept;
@@ -49,7 +53,8 @@ class IntegrityVerifier final {
     explicit IntegrityVerifier(Repository& repository);
 
     [[nodiscard]] VerificationResult verify(VerifyMode mode, std::stop_token stop_token = {},
-                                            ProgressCallback progress = {});
+                                            ProgressCallback progress = {},
+                                            bool verify_files = false);
 
   private:
     Repository& repository_;

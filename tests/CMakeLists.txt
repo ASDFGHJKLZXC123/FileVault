@@ -110,6 +110,14 @@ add_dependencies(localvault_tests localvault_lock_contention_helper localvault_m
 include(GoogleTest)
 gtest_discover_tests(localvault_tests)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(
+    NAME CliEndToEnd
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cli/cli_e2e_test.py"
+            "$<TARGET_FILE:localvault>"
+)
+set_tests_properties(CliEndToEnd PROPERTIES TIMEOUT 180)
+
 localvault_set_warnings(localvault_tests)
 localvault_enable_sanitizers(localvault_tests)
 localvault_enable_clang_tidy(localvault_tests)
