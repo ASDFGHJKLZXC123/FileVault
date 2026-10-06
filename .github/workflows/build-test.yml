@@ -48,6 +48,9 @@ jobs:
           echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
           echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
 
+      - name: Prefetch verified dependency archives
+        run: cmake -P scripts/ci-prefetch.cmake
+
       - name: Configure
         run: cmake --preset development -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
 
@@ -92,6 +95,9 @@ jobs:
           "${VCPKG_ROOT}/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
           echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
+
+      - name: Prefetch verified dependency archives
+        run: cmake -P scripts/ci-prefetch.cmake
 
       - name: Configure ASan and UBSan
         run: cmake --preset sanitizers -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
@@ -138,6 +144,9 @@ jobs:
           echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
           echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
 
+      - name: Prefetch verified dependency archives
+        run: cmake -P scripts/ci-prefetch.cmake
+
       - name: Configure TSan
         run: cmake --preset thread-sanitizer -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
 
@@ -175,6 +184,9 @@ jobs:
           echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
           echo "${VCPKG_ROOT}" >> "$GITHUB_PATH"
 
+      - name: Prefetch verified dependency archives
+        run: cmake -P scripts/ci-prefetch.cmake
+
       - name: Configure
         run: cmake --preset development -DLOCALVAULT_WARNINGS_AS_ERRORS=ON
 
@@ -210,6 +222,9 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           Add-Content $env:GITHUB_ENV "VCPKG_ROOT=$env:VCPKG_ROOT"
           Add-Content $env:GITHUB_PATH "$env:VCPKG_ROOT"
+
+      - name: Prefetch verified dependency archives
+        run: cmake -P scripts/ci-prefetch.cmake
 
       - name: Configure
         run: cmake --preset windows-development -DLOCALVAULT_WARNINGS_AS_ERRORS=ON

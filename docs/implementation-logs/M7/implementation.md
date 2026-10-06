@@ -43,3 +43,7 @@ Status: implementation, critical review, native acceptance, and human check comp
 - CI portability: canonicalize the CLI fixture's existing temporary root before deriving
   restore destinations, avoiding macOS `/var` alias rejection while preserving no-follow
   production checks. Verbose CTest output exposes nested e2e skips in the recorded job logs.
+- Cold CI downloads failed for GoogleTest and GNU gperf before project compilation.
+  Prefetch their exact pinned archives from alternate endpoints with SHA512 verification;
+  network failures retain vcpkg's original fallback, checksum mismatches fail immediately.
+  Keep the prefetch versions/hashes aligned when changing the vcpkg baseline.
