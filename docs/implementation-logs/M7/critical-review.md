@@ -164,3 +164,20 @@ busy/partial/usage errors, snapshot recovery, silent prompt cancellation, and a
 second interrupt during blocked diagnostics. Review of test source is not a claim
 that these cases pass. POSIX/macOS/Windows CI and the human Windows Ctrl+C / PowerShell
 JSON session remain acceptance gates.
+
+## CI repair review — root supplement, 2026-10-06 PDT
+
+Read-only peer review covered the subsequent portability repairs: canonical CLI
+temporary paths; a lambda spool deleter avoiding GCC's attributed-function-pointer
+warning; SHA512-verified alternate dependency downloads with bounded network attempts;
+and complete diagnostic-pipe saturation without weakening forced-exit assertions.
+Further invariant review found that the second SIGINT could interrupt a blocked
+stderr write with EINTR and allow graceful JSON before monitor exit. `SA_RESTART`
+keeps that write blocked until the independent monitor forces exit; handlers still
+only set a lock-free flag and cooperative input retains bounded polling.
+
+All repairs were reviewed; no open source finding remains. Final implementation
+`8c473b7` passed all five jobs in
+[run 37422902785](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/37422902785),
+including all 14 CLI cases and all three signal cases without skips on every
+full-suite runner. Detailed counts and sanitizer scope are in `verification.md`.

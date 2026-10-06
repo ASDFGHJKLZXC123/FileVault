@@ -1,6 +1,6 @@
 # M7 implementation decision record
 
-Status: implementation, critical review, native acceptance, and human check complete; CI pending.
+Status: M7 complete. Implementation, review, native/human acceptance, and all five CI jobs pass.
 
 - User decisions (2026-10-04): restore prompts accept terminal and scripted input; add whole-file
   verification in core; add two narrow QueryService queries; native Windows development with
@@ -25,7 +25,7 @@ Status: implementation, critical review, native acceptance, and human check comp
 - Historical model routes in the orchestration guide are unavailable; available inherited
   agents implement disjoint packets, with separate critical review and fresh verification,
   following the recorded M6 precedent. Root owns all build/test execution.
-- Windows is the actual native host. Linux/macOS/Windows CI and sanitizer jobs remain gates.
+- Windows is the actual native host. Linux/macOS/Windows and both sanitizer CI gates passed.
   Human Windows acceptance passed with saved physical Ctrl+C / PowerShell JSON evidence;
   the user performed the action, and the saved record was inspected independently.
 - Native warning-strict build passes; 254 tests pass with 11 documented platform/dataset skips,
@@ -54,3 +54,5 @@ Status: implementation, critical review, native acceptance, and human check comp
   fails warning-strict builds. Use a lambda deleter for the output spool's same RAII lifetime.
 - POSIX interrupts restart blocked writes: otherwise the second SIGINT can interrupt
   diagnostics with EINTR and allow graceful JSON before the force-exit monitor runs.
+- Final implementation `8c473b7` passed all five jobs in run `37422902785`; all 14 CLI
+  cases passed without skips in each full-suite job. Detailed counts and scope: `verification.md`.
