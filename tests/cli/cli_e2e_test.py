@@ -23,7 +23,7 @@ class CliAcceptance(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="localvault-cli-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.repo = self.root / "vault Δ"
         self.source = self.root / "source 测试"
 

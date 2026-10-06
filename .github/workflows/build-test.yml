@@ -55,7 +55,7 @@ jobs:
         run: cmake --build --preset development --parallel
 
       - name: Test
-        run: ctest --preset development
+        run: ctest --preset development --verbose
 
   linux-sanitizers:
     runs-on: ubuntu-24.04
@@ -100,7 +100,7 @@ jobs:
         run: cmake --build --preset sanitizers --parallel
 
       - name: Test ASan and UBSan
-        run: ctest --preset sanitizers
+        run: ctest --preset sanitizers --verbose
 
   linux-tsan:
     runs-on: ubuntu-24.04
@@ -145,7 +145,7 @@ jobs:
         run: cmake --build --preset thread-sanitizer --parallel
 
       - name: Test concurrency filter under TSan
-        run: ctest --preset thread-sanitizer
+        run: ctest --preset thread-sanitizer --verbose
 
   macos:
     runs-on: macos-15
@@ -184,7 +184,7 @@ jobs:
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --preset development
+        run: ctest --preset development --verbose
 
   windows:
     runs-on: windows-2022
@@ -218,4 +218,4 @@ jobs:
         run: cmake --build --preset windows-development-debug --parallel
 
       - name: Test
-        run: ctest --preset windows-development-debug
+        run: ctest --preset windows-development-debug --verbose

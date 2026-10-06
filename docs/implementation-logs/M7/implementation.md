@@ -40,3 +40,6 @@ Status: implementation, critical review, native acceptance, and human check comp
 - Later-interface gotcha: ordinary WAL queries may update SQLite coordination sidecars;
   maintenance verification/preview must preserve every repository byte, including sidecars.
   Keep OS lock ownership through DB destruction and interrupt ownership through diagnostics.
+- CI portability: canonicalize the CLI fixture's existing temporary root before deriving
+  restore destinations, avoiding macOS `/var` alias rejection while preserving no-follow
+  production checks. Verbose CTest output exposes nested e2e skips in the recorded job logs.
