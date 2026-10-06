@@ -430,11 +430,14 @@ class CliAcceptance(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("runtime cannot configure pipe blocking; forced-interrupt needs the native platform gate")
         try:
-            while True:
-                if os.write(write_fd, b"x" * 4096) == 0:
-                    break
-        except BlockingIOError:
-            pass
+            # An atomic 4KiB write can fail while smaller diagnostics still fit.
+            # Exhaust the remaining capacity byte-by-byte before sending SIGINT.
+            for block in (b"x" * 4096, b"x"):
+                while True:
+                    try:
+                        self.assertGreater(os.write(write_fd, block), 0)
+                    except BlockingIOError:
+                        break
         finally:
             os.set_blocking(write_fd, True)
         self.interrupt(process)

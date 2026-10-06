@@ -47,3 +47,8 @@ Status: implementation, critical review, native acceptance, and human check comp
   Prefetch their exact pinned archives from alternate endpoints with SHA512 verification;
   network failures retain vcpkg's original fallback, checksum mismatches fail immediately.
   Keep the prefetch versions/hashes aligned when changing the vcpkg baseline.
+- macOS forced-interrupt fixture: failed large atomic pipe writes can leave space
+  for a short diagnostic. Fill the remaining capacity with single-byte writes;
+  retain the no-stdout assertion that distinguishes immediate exit from cancellation.
+- GCC/glibc annotate `fclose`; using its function-pointer type as a template argument
+  fails warning-strict builds. Use a lambda deleter for the output spool's same RAII lifetime.

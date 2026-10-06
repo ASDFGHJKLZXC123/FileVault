@@ -128,7 +128,8 @@ int Context::finish(Json result, int exit_code) const {
 }
 
 int Context::finish_array(std::string_view field, const JsonProducer& produce) const {
-    std::unique_ptr<FILE, decltype(&std::fclose)> spool(output_spool(), &std::fclose);
+    const auto close_spool = [](FILE* file) { (void)std::fclose(file); };
+    std::unique_ptr<FILE, decltype(close_spool)> spool(output_spool(), close_spool);
     if (!spool) {
         throw LocalVaultError(ErrorCode::filesystem_error, "cannot create output spool");
     }

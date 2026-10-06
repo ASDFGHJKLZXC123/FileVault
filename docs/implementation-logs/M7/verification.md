@@ -246,3 +246,23 @@ configuration.
   Native checks passed for both cold downloads, simulated Linux host routing,
   verified cache reuse, and deliberate wrong-hash rejection without publication.
   A fresh review confirmed these safeguards and the five workflow call sites.
+- Download-fixed revision `1f24c35f3e92e33b6b6c34e74f161ade1ac04040`,
+  [run 37415937849](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/37415937849),
+  reached macOS build/tests successfully. Its only failure was the forced-interrupt
+  CLI fixture: a failed atomic 4096-byte pipe write could leave room for the short
+  cancellation diagnostic and graceful JSON output. All other 13 CLI cases passed
+  with no skips, including snapshot interrupt/recovery and silent prompt cancellation.
+  CTest recorded 269 passed, one failed, one external-dataset skip, and one disabled
+  manual benchmark (272 registered), 52.54 seconds. The fixture now exhausts the
+  remaining pipe capacity with single-byte writes; forced-exit assertions remain.
+  Native pipe saturation probes confirm that no single byte fits after bulk/tail
+  filling, including when the pipe starts with a seeded partial write.
+- The same run's Linux and TSan jobs failed compilation at `src/cli/output.cpp:131`:
+  GCC emitted `-Werror=ignored-attributes` for `decltype(&std::fclose)` as a
+  `unique_ptr` deleter. Replaced it with a lambda deleter retaining the same
+  close-on-destruction behavior. No tests ran on those failed builds.
+- Secondary Windows evidence from `0097f3e` / run 37413141510:
+  [job 112105824744](https://github.com/ASDFGHJKLZXC123/FileVault/actions/runs/37413141510/job/112105824744)
+  passed 264 of 265 registered CTest entries, with only the opt-in external dataset
+  skipped; 47.83 seconds. All 14 CLI cases passed with zero skips (10.131 seconds).
+  Final acceptance still requires the fully corrected implementation revision.
